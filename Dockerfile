@@ -8,15 +8,15 @@ RUN apk --no-cache add ca-certificates
 # Copy dependency manifests
 COPY go.mod ./
 
-# Download dependencies utilizing Docker BuildKit caching
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# Download dependencies utilizing Docker BuildKit caching with explicit ID
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod go mod download
 
 # Copy source code
 COPY . .
 
 # Build statically linked binary with compiler and module cache mounts
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
+    --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o xrpay ./cmd/xrpay
 
