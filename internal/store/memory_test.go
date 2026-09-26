@@ -10,7 +10,7 @@ import (
 	"github.com/psiloconvalley/xrpay/internal/store"
 )
 
-const testMerchant = "rPT1Sjq2YGrBMTttX4GZHjKu9DYfzbpAYe"
+const testMerchant = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 
 func TestMemoryStore_SaveAndGet(t *testing.T) {
 	ctx := context.Background()

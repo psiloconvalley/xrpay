@@ -34,7 +34,7 @@ func (m *mockClock) Now() time.Time {
 
 func TestPoller_PollOnce_SettlesInvoice(t *testing.T) {
 	ctx := context.Background()
-	merchantAddr := "rPT1Sjq2YGrBMTttX4GZHjKu9DYfzbpAYe"
+	merchantAddr := "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 	tag := uint32(1001)
 
 	// 1. Setup Memory Store and create a pending 10 XRP invoice
@@ -118,7 +118,7 @@ func TestPoller_PollOnce_SettlesInvoice(t *testing.T) {
 
 func TestPoller_PollOnce_ExpiresOverdueInvoices(t *testing.T) {
 	ctx := context.Background()
-	merchantAddr := "rPT1Sjq2YGrBMTttX4GZHjKu9DYfzbpAYe"
+	merchantAddr := "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 	tag := uint32(1002)
 
 	memStore := store.NewMemoryStore()
@@ -165,7 +165,7 @@ func TestPoller_Lifecycle_StartAndStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	merchantAddr := "rPT1Sjq2YGrBMTttX4GZHjKu9DYfzbpAYe"
+	merchantAddr := "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 	memStore := store.NewMemoryStore()
 	fetcher := &mockPaymentFetcher{payments: nil}
 

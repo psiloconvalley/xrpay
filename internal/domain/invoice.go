@@ -26,6 +26,7 @@ var (
 	ErrInvalidAddress    = errors.New("invalid merchant XRPL address (must start with 'r')")
 	ErrInvalidTag        = errors.New("destination tag cannot be zero")
 	ErrInvalidDuration   = errors.New("invoice expiration duration must be positive")
+	ErrInvalidMetadata   = errors.New("invalid invoice metadata") 
 	ErrIllegalTransition = errors.New("illegal invoice status transition")
 	ErrEmptyTxHash       = errors.New("tx hash cannot be empty on settlement")
 	ErrNegativePayment   = errors.New("payment amount cannot be negative")
@@ -60,8 +61,25 @@ func NewInvoice(
 	metadata map[string]string,
 ) (*Invoice, error) {
 	merchantAddr = strings.TrimSpace(merchantAddr)
-	if !strings.HasPrefix(merchantAddr, "r") || len(merchantAddr) < 25 || len(merchantAddr) > 35 {
-		return nil, ErrInvalidAddress
+	if err := ValidateXRPLAddress(merchantAddr); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidAddress, err)
+	}
+	if tag == 0 {
+		return nil, ErrInvalidTag
+	}
+	if amount <= 0 {
+		return nil, ErrInvalidAmount
+	}
+	if duration <= 0 {
+		return nil, ErrInvalidDuration
+	}
+	if len(metadata) > 20 {
+		return nil, fmt.Errorf("%w: metadata cannot exceed 20 keys", ErrInvalidMetadata)
+	}
+	for k, v := range metadata {
+		if len(k) > 64 || len(v) > 500 {
+			return nil, fmt.Errorf("%w: metadata key/value exceeds size limits", ErrInvalidMetadata)
+		}
 	}
 
 	if tag == 0 {

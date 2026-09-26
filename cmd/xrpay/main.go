@@ -25,6 +25,8 @@ type AppConfig struct {
 	MerchantAccount string
 	RPCURL          string
 	WebhookSecret   string
+	APIKey          string
+	Environment     string
 	BaseURL         string
 	PollInterval    time.Duration
 	StartLedger     int64
@@ -52,6 +54,13 @@ func loadConfig() AppConfig {
 		secret = "xrpay_default_insecure_development_secret_key"
 	}
 
+	apiKey := os.Getenv("XRPAY_API_KEY")
+
+	env := os.Getenv("XRPAY_ENV")
+	if env == "" {
+		env = "development"
+	}
+
 	baseURL := os.Getenv("XRPAY_BASE_URL")
 	if baseURL == "" {
 		baseURL = "http://localhost:" + port
@@ -76,10 +85,31 @@ func loadConfig() AppConfig {
 		MerchantAccount: merchantAddr,
 		RPCURL:          rpcURL,
 		WebhookSecret:   secret,
+		APIKey:          apiKey,
+		Environment:     env,
 		BaseURL:         baseURL,
 		PollInterval:    time.Duration(pollSec) * time.Second,
 		StartLedger:     startLedger,
 	}
+}
+
+// Validate checks the runtime configuration against strict production requirements.
+func (c AppConfig) Validate() error {
+	if err := domain.ValidateXRPLAddress(c.MerchantAccount); err != nil {
+		return fmt.Errorf("invalid merchant address: %w", err)
+	}
+	if c.Environment == "production" {
+		if c.WebhookSecret == "xrpay_default_insecure_development_secret_key" {
+			return errors.New("XRPAY_WEBHOOK_SECRET must be set to a secure custom value in production")
+		}
+		if c.APIKey == "" {
+			return errors.New("XRPAY_API_KEY is required in production mode")
+		}
+		if len(c.APIKey) < 16 {
+			return errors.New("XRPAY_API_KEY must be at least 16 characters in production")
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -92,11 +122,18 @@ func main() {
 	cfg := loadConfig()
 	logger.Info("starting xrpay gateway",
 		"version", "1.0.0",
+		"environment", cfg.Environment,
 		"port", cfg.Port,
 		"merchant_account", cfg.MerchantAccount,
 		"rpc_url", cfg.RPCURL,
 		"poll_interval", cfg.PollInterval.String(),
 	)
+
+	// Validate config before doing any work
+	if err := cfg.Validate(); err != nil {
+		logger.Error("startup configuration validation failed", "error", err)
+		os.Exit(1)
+	}
 
 	// 2. Initialize Store
 	memStore := store.NewMemoryStore()
@@ -156,6 +193,7 @@ func main() {
 	apiHandler, err := api.NewHandler(memStore, api.Config{
 		MerchantAccount: cfg.MerchantAccount,
 		BaseURL:         cfg.BaseURL,
+		APIKey:          cfg.APIKey,
 		DefaultDuration: 15 * time.Minute,
 		Logger:          logger,
 	})
@@ -187,9 +225,12 @@ func main() {
 		)
 	})
 
+	// Wrap handler with CORS and Security Headers (Sweep 1)
+	securedHandler := api.SecurityHeadersMiddleware(api.CORSMiddleware(handler))
+
 	server := &http.Server{
 		Addr:         ":" + cfg.Port,
-		Handler:      handler,
+		Handler:      securedHandler,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,

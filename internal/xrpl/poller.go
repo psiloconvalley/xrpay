@@ -78,8 +78,8 @@ func NewPoller(fetcher PaymentFetcher, repo InvoiceRepository, cfg PollerConfig)
 	if repo == nil {
 		return nil, fmt.Errorf("%w: store cannot be nil", ErrInvalidConfig)
 	}
-	if len(cfg.MerchantAccount) < 25 || len(cfg.MerchantAccount) > 35 || cfg.MerchantAccount[0] != 'r' {
-		return nil, fmt.Errorf("%w: invalid merchant address %q", ErrInvalidConfig, cfg.MerchantAccount)
+	if err := domain.ValidateXRPLAddress(cfg.MerchantAccount); err != nil {
+		return nil, fmt.Errorf("%w: invalid merchant address %q: %v", ErrInvalidConfig, cfg.MerchantAccount, err)
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 3 * time.Second

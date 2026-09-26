@@ -7,7 +7,7 @@ import (
 	"github.com/psiloconvalley/xrpay/internal/domain"
 )
 
-const validMerchant = "rPT1Sjq2YGrBMTttX4GZHjKu9DYfzbpAYe"
+const validMerchant = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 const validTx = "4B8F9A1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9"
 
 func TestNewInvoice_Success(t *testing.T) {

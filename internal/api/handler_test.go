@@ -14,7 +14,7 @@ import (
 )
 
 func setupTestServer(t *testing.T) (*http.ServeMux, string) {
-	merchantAddr := "rPT1Sjq2YGrBMTttX4GZHjKu9DYfzbpAYe"
+	merchantAddr := "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
 	memStore := store.NewMemoryStore()
 
 	handler, err := api.NewHandler(memStore, api.Config{
@@ -152,5 +152,66 @@ func TestCreateInvoice_InvalidPayloads(t *testing.T) {
 				t.Errorf("expected status %d, got %d", tc.expectCode, w.Code)
 			}
 		})
+	}
+}
+func TestCreateInvoice_Authentication(t *testing.T) {
+	merchantAddr := "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+	memStore := store.NewMemoryStore()
+	apiKey := "sk_test_secret_api_key_12345"
+
+	handler, err := api.NewHandler(memStore, api.Config{
+		MerchantAccount: merchantAddr,
+		APIKey:          apiKey,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler failed: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+
+	payload := `{"order_id":"auth_test","amount":"10.0"}`
+
+	// 1. Request without Authorization header must fail with 401
+	reqNoAuth := httptest.NewRequest(http.MethodPost, "/api/v1/invoices", bytes.NewReader([]byte(payload)))
+	wNoAuth := httptest.NewRecorder()
+	mux.ServeHTTP(wNoAuth, reqNoAuth)
+	if wNoAuth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for missing auth, got %d", wNoAuth.Code)
+	}
+
+	// 2. Request with invalid API key must fail with 401
+	reqWrongAuth := httptest.NewRequest(http.MethodPost, "/api/v1/invoices", bytes.NewReader([]byte(payload)))
+	reqWrongAuth.Header.Set("Authorization", "Bearer sk_wrong_key")
+	wWrongAuth := httptest.NewRecorder()
+	mux.ServeHTTP(wWrongAuth, reqWrongAuth)
+	if wWrongAuth.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 Unauthorized for wrong key, got %d", wWrongAuth.Code)
+	}
+
+	// 3. Request with valid API key must succeed with 201
+	reqValidAuth := httptest.NewRequest(http.MethodPost, "/api/v1/invoices", bytes.NewReader([]byte(payload)))
+	reqValidAuth.Header.Set("Authorization", "Bearer "+apiKey)
+	wValidAuth := httptest.NewRecorder()
+	mux.ServeHTTP(wValidAuth, reqValidAuth)
+	if wValidAuth.Code != http.StatusCreated {
+		t.Errorf("expected 201 Created for valid auth, got %d", wValidAuth.Code)
+	}
+}
+
+func TestCORS_Preflight(t *testing.T) {
+	mux, _ := setupTestServer(t)
+	wrapped := api.CORSMiddleware(mux)
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/v1/invoices", nil)
+	w := httptest.NewRecorder()
+
+	wrapped.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Errorf("expected 204 No Content for OPTIONS preflight, got %d", w.Code)
+	}
+	if w.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("expected Access-Control-Allow-Origin: *")
 	}
 }

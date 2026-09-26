@@ -57,7 +57,7 @@ func TestDispatcher_DispatchSync_Success(t *testing.T) {
 	defer server.Close()
 
 	amount, _ := domain.ParseXRP("10.0")
-	inv, _ := domain.NewInvoice("order_1", "rPT1Sjq2YGrBMTttX4GZHjKu9DYfzbpAYe", 1001, amount, 15*time.Minute, server.URL, nil)
+	inv, _ := domain.NewInvoice("order_1", "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", 1001, amount, 15*time.Minute, server.URL, nil)
 
 	secret := "whsec_test_mock_secret"
 	dispatcher, err := webhook.NewDispatcher(webhook.Config{
@@ -104,7 +104,7 @@ func TestDispatcher_DispatchSync_RetryThenFail(t *testing.T) {
 	defer server.Close()
 
 	amount, _ := domain.ParseXRP("10.0")
-	inv, _ := domain.NewInvoice("order_fail", "rPT1Sjq2YGrBMTttX4GZHjKu9DYfzbpAYe", 1002, amount, 15*time.Minute, server.URL, nil)
+	inv, _ := domain.NewInvoice("order_fail", "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh", 1002, amount, 15*time.Minute, server.URL, nil)
 
 	dispatcher, err := webhook.NewDispatcher(webhook.Config{
 		WebhookSecret: "whsec_test",

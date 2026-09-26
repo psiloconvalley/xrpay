@@ -26,6 +26,7 @@ type InvoiceManager interface {
 type Config struct {
 	MerchantAccount string
 	BaseURL         string
+	APIKey		string
 	DefaultDuration time.Duration
 	Logger          *slog.Logger
 }
@@ -35,6 +36,7 @@ type Handler struct {
 	store           InvoiceManager
 	merchantAccount string
 	baseURL         string
+	apiKey		string
 	defaultDuration time.Duration
 	logger          *slog.Logger
 	checkoutTmpl    *template.Template
@@ -95,6 +97,7 @@ func NewHandler(sm InvoiceManager, cfg Config) (*Handler, error) {
 		store:           sm,
 		merchantAccount: cfg.MerchantAccount,
 		baseURL:         cfg.BaseURL,
+		apiKey:		 cfg.APIKey,
 		defaultDuration: cfg.DefaultDuration,
 		logger:          cfg.Logger.With("component", "api.handler"),
 		checkoutTmpl:    tmpl,
@@ -104,7 +107,7 @@ func NewHandler(sm InvoiceManager, cfg Config) (*Handler, error) {
 // RegisterRoutes mounts API endpoints onto a http.ServeMux using Go 1.22 routing.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", h.handleHealthCheck)
-	mux.HandleFunc("POST /api/v1/invoices", h.handleCreateInvoice)
+	mux.HandleFunc("POST /api/v1/invoices", RequireAuth(h.apiKey, h.handleCreateInvoice))
 	mux.HandleFunc("GET /api/v1/invoices/{id}", h.handleGetInvoice)
 	mux.HandleFunc("GET /checkout/{id}", h.handleCheckoutPage)
 }
