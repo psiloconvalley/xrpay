@@ -8,13 +8,12 @@ type RPCRequest struct {
 
 // AccountTxParams parameters for the "account_tx" method.
 type AccountTxParams struct {
-	Account        string `json:"account"`
-	LedgerIndexMin int64  `json:"ledger_index_min"` // -1 for earliest available
-	LedgerIndexMax int64  `json:"ledger_index_max"` // -1 for latest available
-	Limit          int    `json:"limit,omitempty"`
-	Forward        bool   `json:"forward,omitempty"` // true = chronological order
+	Account        string      `json:"account"`
+	LedgerIndexMin interface{} `json:"ledger_index_min,omitempty"` // int64, string, or omitted
+	LedgerIndexMax interface{} `json:"ledger_index_max,omitempty"` // int64, string, or omitted
+	Limit          int         `json:"limit,omitempty"`
+	Forward        bool        `json:"forward,omitempty"` // true = chronological order
 }
-
 // AccountTxResponse represents the top-level response from "account_tx".
 type AccountTxResponse struct {
 	Result AccountTxResult `json:"result"`

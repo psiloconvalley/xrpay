@@ -54,16 +54,21 @@ func NewClient(endpoint string) *Client {
 
 // GetAccountPayments fetches validated incoming XRP payments for an address.
 func (c *Client) GetAccountPayments(ctx context.Context, account string, minLedger int64) ([]PaymentEvent, error) {
+	params := AccountTxParams{
+		Account: account,
+		Forward: true,
+	}
+
+	// Only specify range if we have a valid positive ledger checkpoint cursor.
+	// Otherwise, omitting both tells the node to check all available ledgers.
+	if minLedger > 0 {
+		params.LedgerIndexMin = minLedger
+		params.LedgerIndexMax = "-1"
+	}
+
 	reqBody := RPCRequest{
 		Method: "account_tx",
-		Params: []interface{}{
-			AccountTxParams{
-				Account:        account,
-				LedgerIndexMin: minLedger,
-				LedgerIndexMax: -1,
-				Forward:        true,
-			},
-		},
+		Params: []interface{}{params},
 	}
 
 	jsonPayload, err := json.Marshal(reqBody)
