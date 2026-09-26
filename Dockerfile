@@ -1,23 +1,15 @@
-# Stage 1: Build the statically linked Go binary with compiler cache mounts
+# Stage 1: Build the statically linked Go binary
 FROM golang:1.22-alpine AS builder
 WORKDIR /app
 
-# Ensure we have CA certificates available for copy if needed
-RUN apk --no-cache add ca-certificates
-
-# Copy dependency manifests
+# Copy dependency manifest
 COPY go.mod ./
-
-# Download dependencies utilizing Docker BuildKit caching with explicit ID
-RUN --mount=type=cache,id=gomod,target=/go/pkg/mod go mod download
 
 # Copy source code
 COPY . .
 
-# Build statically linked binary with compiler and module cache mounts
-RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
-    --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+# Build statically linked binary with stripped debug symbols
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o xrpay ./cmd/xrpay
 
 # Stage 2: Final micro-image with zero OS shell utilities
