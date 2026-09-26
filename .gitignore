@@ -1,0 +1,29 @@
+# Compiled binaries
+/xrpay
+/server
+/bin
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.*
+/coverage
+
+# Go build artifacts
+/dist
+/tmp
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
