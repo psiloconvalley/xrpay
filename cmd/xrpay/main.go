@@ -31,6 +31,7 @@ type AppConfig struct {
 	BaseURL         string
 	PollInterval    time.Duration
 	StartLedger     int64
+	TrustProxy      bool
 }
 
 func loadConfig() AppConfig {
@@ -80,6 +81,8 @@ func loadConfig() AppConfig {
 		}
 	}
 
+	trustProxy := os.Getenv("XRPAY_TRUST_PROXY") == "true" || env == "production"
+
 	return AppConfig{
 		Port:            port,
 		MerchantAccount: merchantAddr,
@@ -90,6 +93,7 @@ func loadConfig() AppConfig {
 		BaseURL:         baseURL,
 		PollInterval:    time.Duration(pollSec) * time.Second,
 		StartLedger:     startLedger,
+		TrustProxy:      trustProxy,
 	}
 }
 
@@ -125,6 +129,7 @@ func main() {
 		"merchant_account", cfg.MerchantAccount,
 		"rpc_url", cfg.RPCURL,
 		"poll_interval", cfg.PollInterval.String(),
+		"trust_proxy", cfg.TrustProxy,
 	)
 
 	if err := cfg.Validate(); err != nil {
@@ -145,7 +150,20 @@ func main() {
 	// 4. API Handlers & Routes
 	apiHandler := api.NewHandler(memStore, cfg.MerchantAccount, 15*time.Minute)
 
+	// 5. Rate Limiters (5 burst capacity, refilling 10 tokens per minute)
+	demoLimiter := security.NewIPRateLimiter(5.0, 10.0, 1*time.Minute)
+	defer demoLimiter.Stop()
+
 	mux := http.NewServeMux()
+
+	// Landing Page (Public)
+	mux.HandleFunc("/", apiHandler.LandingHandler)
+
+	// Demo Sandbox Invoice Creator (Rate-limited, Public)
+	mux.HandleFunc("/demo/invoice", security.RateLimitMiddleware(demoLimiter, cfg.TrustProxy, apiHandler.DemoInvoiceHandler))
+
+	// Telemetry Endpoint (Public, cached)
+	mux.HandleFunc("/api/v1/telemetry", apiHandler.TelemetryHandler)
 
 	// Health Check
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
