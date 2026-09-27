@@ -11,6 +11,12 @@ import (
 	"github.com/psiloconvalley/xrpay/internal/webhook"
 )
 
+// LedgerBookmarkStore is an optional interface a store can implement
+// to persist the highest processed ledger sequence across gateway restarts.
+type LedgerBookmarkStore interface {
+	SetLastProcessedLedger(ctx context.Context, index int64) error
+}
+
 // BoundedTxCache stores up to maxSize transaction hashes with FIFO eviction.
 type BoundedTxCache struct {
 	mu      sync.RWMutex
@@ -143,6 +149,11 @@ func (p *Poller) reconcile(ctx context.Context) error {
 
 	if latestLedger > p.lastLedger {
 		p.lastLedger = latestLedger
+		if bookmarkStore, ok := p.store.(LedgerBookmarkStore); ok {
+			if err := bookmarkStore.SetLastProcessedLedger(ctx, latestLedger); err != nil {
+				slog.Warn("failed persisting last processed ledger bookmark", "ledger", latestLedger, "err", err)
+			}
+		}
 	}
 
 	for _, payment := range payments {

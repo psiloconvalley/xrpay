@@ -103,7 +103,7 @@ func (c *Client) GetAccountPayments(ctx context.Context, account string, minLedg
 	}
 
 	payments := make([]AccountPayment, 0, len(rpcResp.Result.Transactions))
-	var latestLedger int64 = minLedger
+	latestLedger := minLedger
 
 	for _, txItem := range rpcResp.Result.Transactions {
 		if txItem.Tx.TransactionType != "Payment" {
@@ -119,8 +119,16 @@ func (c *Client) GetAccountPayments(ctx context.Context, account string, minLedg
 			continue
 		}
 
-		if int64(txItem.Tx.LedgerIndex) > latestLedger {
-			latestLedger = int64(txItem.Tx.LedgerIndex)
+		ledgerIdx := int64(txItem.Tx.LedgerIndex)
+		if ledgerIdx == 0 {
+			ledgerIdx = int64(txItem.Tx.InLedger)
+		}
+		if ledgerIdx == 0 {
+			ledgerIdx = int64(txItem.LedgerIndex)
+		}
+
+		if ledgerIdx > latestLedger {
+			latestLedger = ledgerIdx
 		}
 
 		// Security: Check DeliveredAmount to avoid partial payment exploits
@@ -144,7 +152,7 @@ func (c *Client) GetAccountPayments(ctx context.Context, account string, minLedg
 
 		payments = append(payments, AccountPayment{
 			TxHash:         txItem.Tx.Hash,
-			LedgerIndex:    int64(txItem.Tx.LedgerIndex),
+			LedgerIndex:    ledgerIdx,
 			DeliveredDrops: domain.Drops(dropsInt),
 			DestinationTag: txItem.Tx.DestinationTag,
 			Account:        txItem.Tx.Account,
