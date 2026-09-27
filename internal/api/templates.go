@@ -17,6 +17,7 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             --text-muted: #4b5563;
             --accent-emerald: #10b981;
             --accent-cyan: #38bdf8;
+            --accent-amber: #f59e0b;
             --accent-glow: rgba(56, 189, 248, 0.15);
             --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
         }
@@ -54,9 +55,7 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             color: var(--text-primary);
             text-decoration: none;
         }
-        .logo span {
-            color: var(--accent-cyan);
-        }
+        .logo span { color: var(--accent-cyan); }
         .heartbeat {
             display: flex;
             align-items: center;
@@ -169,9 +168,7 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             padding: 1.75rem;
             transition: border-color 0.2s ease;
         }
-        .feature:hover {
-            border-color: rgba(56, 189, 248, 0.3);
-        }
+        .feature:hover { border-color: rgba(56, 189, 248, 0.3); }
         .feat-title {
             font-size: 1.1rem;
             font-weight: 700;
@@ -181,50 +178,7 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             gap: 0.5rem;
             color: #fff;
         }
-        .feat-desc {
-            font-size: 0.9rem;
-            color: var(--text-secondary);
-            line-height: 1.5;
-        }
-        .table-container {
-            background: var(--bg-surface);
-            border: 1px solid var(--border-muted);
-            border-radius: 12px;
-            padding: 1.5rem;
-            margin-bottom: 4.5rem;
-            overflow-x: auto;
-        }
-        .table-title {
-            font-family: var(--font-mono);
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 0.1em;
-            color: var(--accent-cyan);
-            margin-bottom: 1rem;
-            font-weight: 700;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            text-align: left;
-            font-size: 0.9rem;
-        }
-        th, td {
-            padding: 0.75rem 1rem;
-            border-bottom: 1px solid var(--border-muted);
-        }
-        th {
-            color: var(--text-secondary);
-            font-weight: 600;
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
-        tr:last-child td {
-            border-bottom: none;
-        }
-        .text-green { color: var(--accent-emerald); font-weight: 600; }
-        .text-red { color: #f43f5e; }
+        .feat-desc { font-size: 0.9rem; color: var(--text-secondary); line-height: 1.5; }
         .sandbox-card {
             background: linear-gradient(145deg, var(--bg-surface) 0%, #0d1321 100%);
             border: 1px solid var(--border-muted);
@@ -256,9 +210,16 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             color: #fff;
             letter-spacing: 0.05em;
         }
-        .form-group {
-            margin-bottom: 1.5rem;
+        .form-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.25rem;
+            margin-bottom: 1.25rem;
         }
+        @media (max-width: 640px) {
+            .form-grid { grid-template-columns: 1fr; }
+        }
+        .form-group { margin-bottom: 1.25rem; }
         label {
             display: block;
             font-size: 0.75rem;
@@ -268,7 +229,7 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             margin-bottom: 0.5rem;
             font-weight: 700;
         }
-        input {
+        input, select {
             width: 100%;
             background: #020617;
             border: 1px solid var(--border-muted);
@@ -278,11 +239,35 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             font-size: 1rem;
             outline: none;
             transition: all 0.15s ease;
+            font-family: inherit;
         }
-        input:focus {
+        input:focus, select:focus {
             border-color: var(--accent-cyan);
             box-shadow: 0 0 0 3px var(--accent-glow);
         }
+        .table-container {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-muted);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 4.5rem;
+            overflow-x: auto;
+        }
+        .table-title {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--accent-cyan);
+            margin-bottom: 1rem;
+            font-weight: 700;
+        }
+        table { width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem; }
+        th, td { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border-muted); }
+        th { color: var(--text-secondary); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        tr:last-child td { border-bottom: none; }
+        .text-green { color: var(--accent-emerald); font-weight: 600; }
+        .text-red { color: #f43f5e; }
         .code-box {
             background: #020617;
             border: 1px solid var(--border-muted);
@@ -328,7 +313,7 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             <h1>Accept XRP Payments With<br><span>0% Fees & No Third-Party.</span></h1>
             <p class="subhead">The self-hosted, non-custodial L1 payment gateway in pure Go. Your keys, your consensus settlement, zero intermediary holds, zero regulatory overhead.</p>
             <div class="btn-group">
-                <a href="#sandbox" class="btn">Launch Payment Demo &rarr;</a>
+                <a href="#checkout-tool" class="btn">Launch Point-of-Sale / Tip &rarr;</a>
                 <a href="https://github.com/psiloconvalley/xrpay" target="_blank" class="btn btn-secondary">Inspect Source Code</a>
             </div>
         </section>
@@ -346,6 +331,34 @@ const landingHTMLTemplate = `<!DOCTYPE html>
                 <div class="feat-title"><span style="color:var(--accent-cyan)">⏣</span> Zero Reserve Bloat</div>
                 <div class="feat-desc">Assign infinite customers to a single master classic wallet using per-invoice Destination Tags. No 10-XRP wallet reserves required.</div>
             </div>
+        </section>
+
+        <!-- Dynamic POS Generator / Donation & Tipping Hub -->
+        <section id="checkout-tool" class="sandbox-card">
+            <div class="card-header">
+                <div class="card-title">⏣ INSTANT POINT-OF-SALE &amp; DONATION CHECKOUT</div>
+                <span class="heartbeat" style="color:var(--accent-cyan); background:rgba(56,189,248,0.08); border-color:rgba(56,189,248,0.2);">0% PLATFORM FEE</span>
+            </div>
+            <form action="/demo/invoice" method="POST">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label for="currency">Settlement Currency</label>
+                        <select id="currency" name="currency">
+                            <option value="XRP">XRP (Native L1 • 3.5s Settlement)</option>
+                            <option value="RLUSD" disabled>RLUSD (Ripple USD • Coming with Mainnet)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="amount">Custom Amount (Enter Any XRP Value)</label>
+                        <input type="text" id="amount" name="amount" value="5.00" placeholder="e.g. 2.50, 10, 100" required>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="memo">Order Description / Tip Message (Optional)</label>
+                    <input type="text" id="memo" name="memo" value="Support Sovereign Open-Source xrpay" placeholder="e.g. Donation from @twitterhandle, Coffee tip, or API invoice">
+                </div>
+                <button type="submit" class="btn" style="width: 100%; background: var(--accent-cyan); color: var(--bg-primary); font-weight: 800;">Generate Point-of-Sale Checkout &rarr;</button>
+            </form>
         </section>
 
         <section class="table-container">
@@ -382,26 +395,8 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             </table>
         </section>
 
-        <section id="sandbox" class="sandbox-card">
-            <div class="card-header">
-                <div class="card-title">⏣ INTERACTIVE LIVE PLAYGROUND</div>
-                <span class="heartbeat" style="color:var(--accent-cyan); background:rgba(56,189,248,0.08); border-color:rgba(56,189,248,0.2);">TESTNET GATEWAY</span>
-            </div>
-            <form action="/demo/invoice" method="POST">
-                <div class="form-group">
-                    <label for="amount">Testnet Bill Amount (XRP)</label>
-                    <input type="text" id="amount" name="amount" value="5.00" required>
-                </div>
-                <div class="form-group">
-                    <label for="memo">Order / SaaS Subscription Title</label>
-                    <input type="text" id="memo" name="memo" value="Startup Tier API access" required>
-                </div>
-                <button type="submit" class="btn" style="width: 100%; background: var(--accent-cyan); color: var(--bg-primary); font-weight: 800;">Generate Sandbox Invoice &amp; Settle &rarr;</button>
-            </form>
-        </section>
-
         <section class="code-box">
-            <div class="code-header">Spin Up Your Sandbox Locally In 3 Seconds</div>
+            <div class="code-header">Spin Up Your Gateway Locally In 3 Seconds</div>
             <code>$ docker run -d -p 8080:8080 \
   -e XRPAY_MERCHANT_ADDR="{{.MerchantAddress}}" \
   -e XRPAY_API_KEY="your-highly-secure-gateway-token" \
@@ -586,9 +581,7 @@ const checkoutHTMLTemplate = `<!DOCTYPE html>
             width: 100%;
             transition: all 0.1s ease;
         }
-        .btn-simulate:hover {
-            opacity: 0.9;
-        }
+        .btn-simulate:hover { opacity: 0.9; }
         .btn-simulate:disabled {
             background: var(--border-color);
             color: var(--text-muted);
@@ -622,7 +615,7 @@ const checkoutHTMLTemplate = `<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Simulation Tool to give developers an instant 'aha!' experience on Testnet -->
+        <!-- Simulation Tool for immediate feedback on Testnet -->
         <div class="simulation-faucet-box">
             <p>Evaluating? Trigger an immediate simulated on-chain payment on the Ripple Testnet consensus network.</p>
             <button id="sim-btn" class="btn-simulate" onclick="simulatePayment()">⚡ Simulate Testnet Consensus Payment</button>
@@ -695,7 +688,6 @@ const checkoutHTMLTemplate = `<!DOCTYPE html>
             btn.disabled = true;
             btn.innerText = "Querying Faucet Network...";
 
-            // Hit the official testnet faucet to auto-simulate sending the payload
             fetch("https://faucet.altnet.rippletest.net/accounts", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" }
@@ -704,7 +696,6 @@ const checkoutHTMLTemplate = `<!DOCTYPE html>
             .then(faucetData => {
                 btn.innerText = "Signing Simulated L1 Tx...";
                 
-                // Construct transactional payload representing the customer sending funds
                 const txBody = {
                     method: "submit",
                     params: [{
@@ -719,7 +710,6 @@ const checkoutHTMLTemplate = `<!DOCTYPE html>
                     }]
                 };
 
-                // Post directly to the Testnet RPC node to push tx into consensus
                 return fetch("https://s.altnet.rippletest.net:51234", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
