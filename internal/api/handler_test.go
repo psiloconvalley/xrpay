@@ -32,8 +32,8 @@ func TestHandler_LandingPage(t *testing.T) {
 	}
 
 	body := rr.Body.String()
-	if !strings.Contains(body, "xrpay") || !strings.Contains(body, "Self-host XRP payments") {
-		t.Fatalf("expected elegant terminal title on root page, got: %s", body)
+	if !strings.Contains(body, "xrpay") || !strings.Contains(body, "0% Fees & No Third-Party") {
+		t.Fatalf("expected beautiful sovereign billing title on root page, got: %s", body)
 	}
 }
 
