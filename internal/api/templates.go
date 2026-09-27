@@ -287,77 +287,6 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             text-transform: uppercase;
             letter-spacing: 0.15em;
         }
-        .donation-card {
-            background: linear-gradient(145deg, var(--bg-surface) 0%, #061512 100%);
-            border: 1px solid rgba(16, 185, 129, 0.2);
-            border-radius: 12px;
-            padding: 2.25rem;
-            margin-bottom: 4.5rem;
-            position: relative;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
-            display: flex;
-            gap: 2rem;
-            align-items: center;
-        }
-        .donation-card::before {
-            content: '';
-            position: absolute;
-            top: 0; left: 0; right: 0; height: 3px;
-            background: var(--accent-emerald);
-            border-radius: 12px 12px 0 0;
-        }
-        .donation-info { flex: 1; }
-        .donation-qr {
-            background: #fff;
-            padding: 10px;
-            border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: 140px;
-            height: 140px;
-            flex-shrink: 0;
-        }
-        @media (max-width: 640px) {
-            .donation-card { flex-direction: column; text-align: center; }
-            .donation-qr { order: -1; }
-        }
-        .donation-title {
-            font-size: 1.1rem;
-            font-weight: 800;
-            color: #fff;
-            margin-bottom: 0.5rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        .donation-address {
-            background: #020617;
-            border: 1px solid var(--border-muted);
-            padding: 0.75rem 1rem;
-            border-radius: 6px;
-            font-family: var(--font-mono);
-            font-size: 0.85rem;
-            color: var(--accent-emerald);
-            margin: 1rem 0;
-            word-break: break-all;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-        .btn-copy {
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid var(--border-muted);
-            color: var(--text-secondary);
-            padding: 0.35rem 0.65rem;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 0.75rem;
-            font-family: sans-serif;
-            font-weight: 600;
-            transition: all 0.1s ease;
-        }
-        .btn-copy:hover { color: #fff; border-color: var(--text-secondary); }
         footer {
             border-top: 1px solid var(--border-muted);
             padding-top: 2.5rem;
@@ -435,26 +364,6 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             </form>
         </section>
 
-        <!-- Dedicated Support / Mainnet Donations Panel -->
-        <section class="donation-card">
-            <div class="donation-info">
-                <div class="donation-title">💚 SUPPORT XRPAY OPEN-SOURCE DEVELOPMENT</div>
-                <p style="font-size: 0.9rem; color: var(--text-secondary); line-height: 1.5;">
-                    xrpay is 100% free, MIT-licensed, and self-funded. If you'd like to support our work in building sovereign, zero-fee payment infrastructure, you can tip us real XRP to our project's Mainnet wallet below.
-                </p>
-                <div class="donation-address">
-                    <span id="donate-addr">rwD1bRFNqjyxPqcSkje5UuBYttqLf7Q92V</span>
-                    <button class="btn-copy" onclick="copyText('donate-addr')">Copy</button>
-                </div>
-                <p style="font-size: 0.75rem; color: var(--text-muted);">
-                    * Note: This classic address is monitored on the Mainnet L1 ledger. Thank you for your support!
-                </p>
-            </div>
-            <div class="donation-qr">
-                <img src="https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=xrpl:rwD1bRFNqjyxPqcSkje5UuBYttqLf7Q92V" alt="Donation Address QR" width="120" height="120">
-            </div>
-        </section>
-
         <section class="table-container">
             <div class="table-title">Comparing Merchant Settlement Infrastructure</div>
             <table>
@@ -506,18 +415,6 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             </p>
         </footer>
     </div>
-
-    <script>
-        function copyText(id) {
-            const text = document.getElementById(id).innerText;
-            navigator.clipboard.writeText(text).then(() => {
-                const btn = event.target;
-                const orig = btn.innerText;
-                btn.innerText = "Copied!";
-                setTimeout(() => { btn.innerText = orig; }, 1500);
-            });
-        }
-    </script>
 </body>
 </html>`
 
