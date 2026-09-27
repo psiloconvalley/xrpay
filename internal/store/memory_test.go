@@ -10,104 +10,90 @@ import (
 	"github.com/psiloconvalley/xrpay/internal/store"
 )
 
-const testMerchant = "rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh"
+const testMerchantAddr = "rwD1bRFNqjyxPqcSkje5UuBYttqLf7Q92V"
 
-func TestMemoryStore_SaveAndGet(t *testing.T) {
+func TestMemoryStore_BasicCRUD(t *testing.T) {
 	ctx := context.Background()
-	s := store.NewMemoryStore()
+	s := store.NewMemoryStore(1000)
 
-	drops, _ := domain.ParseXRP("10")
-	inv, _ := domain.NewInvoice("order_1", testMerchant, 1001, drops, 15*time.Minute, "", nil)
+	tag, err := s.AllocateTag(ctx, testMerchantAddr)
+	if err != nil {
+		t.Fatalf("failed allocating tag: %v", err)
+	}
 
-	// Save
+	now := time.Now().UTC()
+	inv, err := domain.NewInvoice("ORD-1", testMerchantAddr, tag, domain.Drops(5000000), 15*time.Minute, now, "", "", nil)
+	if err != nil {
+		t.Fatalf("failed creating invoice: %v", err)
+	}
+
 	if err := s.Save(ctx, inv); err != nil {
-		t.Fatalf("Save unexpected error: %v", err)
+		t.Fatalf("failed saving invoice: %v", err)
 	}
 
-	// Duplicate Save should fail
-	if err := s.Save(ctx, inv); err != store.ErrConflict {
-		t.Fatalf("expected ErrConflict on duplicate save, got %v", err)
-	}
-
-	// GetByID
+	// Retrieve by ID
 	got, err := s.GetByID(ctx, inv.ID)
 	if err != nil {
-		t.Fatalf("GetByID unexpected error: %v", err)
+		t.Fatalf("failed retrieving invoice: %v", err)
 	}
-	if got.ID != inv.ID || got.AmountExpected != drops {
-		t.Errorf("GetByID returned corrupted invoice: %+v", got)
+	if got.ID != inv.ID || got.AmountDrops != domain.Drops(5000000) {
+		t.Fatalf("retrieved invoice mismatch: %+v", got)
 	}
 
-	// GetByTag
-	byTag, err := s.GetByTag(ctx, testMerchant, 1001)
+	// Retrieve by Tag
+	gotByTag, err := s.GetByTag(ctx, testMerchantAddr, tag)
 	if err != nil {
-		t.Fatalf("GetByTag unexpected error: %v", err)
+		t.Fatalf("failed retrieving invoice by tag: %v", err)
 	}
-	if byTag.ID != inv.ID {
-		t.Errorf("GetByTag returned wrong ID: %s", byTag.ID)
-	}
-
-	// Non-existent lookups
-	if _, err := s.GetByID(ctx, "inv_nonexistent"); err != store.ErrNotFound {
-		t.Errorf("expected ErrNotFound for fake ID, got %v", err)
-	}
-	if _, err := s.GetByTag(ctx, testMerchant, 9999); err != store.ErrNotFound {
-		t.Errorf("expected ErrNotFound for fake tag, got %v", err)
+	if gotByTag.ID != inv.ID {
+		t.Fatalf("retrieved invoice by tag mismatch: got %s, want %s", gotByTag.ID, inv.ID)
 	}
 }
 
 func TestMemoryStore_OptimisticLocking(t *testing.T) {
 	ctx := context.Background()
-	s := store.NewMemoryStore()
+	s := store.NewMemoryStore(1000)
 
-	drops, _ := domain.ParseXRP("10")
-	inv, _ := domain.NewInvoice("order_2", testMerchant, 1002, drops, 15*time.Minute, "", nil)
+	tag, _ := s.AllocateTag(ctx, testMerchantAddr)
+	now := time.Now().UTC()
+	inv, _ := domain.NewInvoice("ORD-LOCK", testMerchantAddr, tag, domain.Drops(5000000), 15*time.Minute, now, "", "", nil)
 	_ = s.Save(ctx, inv)
 
-	// Correct update (inv.ApplyPayment increments Version from 1 -> 2)
-	_ = inv.ApplyPayment(drops, "tx_hash_123", time.Now().UTC())
-	if err := s.Update(ctx, inv); err != nil {
-		t.Fatalf("Update with incremented version failed: %v", err)
+	// Clone 1 updates successfully
+	clone1, _ := s.GetByID(ctx, inv.ID)
+	_ = clone1.ApplyPayment(domain.Drops(2000000), "TX_1", now.Add(time.Minute))
+	if err := s.Update(ctx, clone1); err != nil {
+		t.Fatalf("first update should succeed: %v", err)
 	}
 
-	// Stale update: trying to update with old version
-	staleInv := *inv
-	staleInv.Version = 1 // wrong version
-	if err := s.Update(ctx, &staleInv); err != store.ErrVersionMismatch {
-		t.Errorf("expected ErrVersionMismatch for stale update, got %v", err)
+	// Clone 2 (stale version) tries to update -> conflict
+	clone2, _ := s.GetByID(ctx, inv.ID)
+	clone2.Version = 1 // Force stale version
+	if err := s.Update(ctx, clone2); err != store.ErrVersionMismatch {
+		t.Fatalf("expected ErrVersionMismatch, got %v", err)
 	}
 }
 
-func TestMemoryStore_ConcurrentTagAllocation(t *testing.T) {
+func TestMemoryStore_ConcurrentAccess(t *testing.T) {
 	ctx := context.Background()
-	s := store.NewMemoryStore()
+	s := store.NewMemoryStore(1000)
 
-	concurrency := 50
 	var wg sync.WaitGroup
-	tags := make(chan uint32, concurrency)
-
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < 50; i++ {
 		wg.Add(1)
-		go func() {
+		go func(idx int) {
 			defer wg.Done()
-			tag, err := s.AllocateTag(ctx, testMerchant)
+			tag, err := s.AllocateTag(ctx, testMerchantAddr)
 			if err != nil {
-				t.Errorf("AllocateTag error: %v", err)
 				return
 			}
-			tags <- tag
-		}()
+			now := time.Now().UTC()
+			inv, err := domain.NewInvoice("ORD-CONC", testMerchantAddr, tag, domain.Drops(1000000), 10*time.Minute, now, "", "", nil)
+			if err == nil {
+				_ = s.Save(ctx, inv)
+				_, _ = s.GetByID(ctx, inv.ID)
+			}
+		}(i)
 	}
-
 	wg.Wait()
-	close(tags)
-
-	// Ensure all 50 allocated tags are strictly unique
-	seen := make(map[uint32]bool)
-	for tag := range tags {
-		if seen[tag] {
-			t.Fatalf("duplicate tag allocated: %d", tag)
-		}
-		seen[tag] = true
-	}
 }

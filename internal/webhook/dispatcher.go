@@ -5,181 +5,176 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/psiloconvalley/xrpay/internal/domain"
 )
-
-// Sentinel errors for webhook operations.
-var (
-	ErrInvalidWebhookConfig = errors.New("invalid webhook configuration")
-	ErrDeliveryFailed       = errors.New("webhook delivery failed after maximum retries")
-	ErrEmptyPayload         = errors.New("webhook payload cannot be empty")
-)
-
-// EventType represents the category of the webhook notification.
-type EventType string
 
 const (
-	EventInvoiceSettled       EventType = "invoice.settled"
-	EventInvoicePartiallyPaid EventType = "invoice.partially_paid"
-	EventInvoiceOverpaid      EventType = "invoice.overpaid"
-	EventInvoiceExpired       EventType = "invoice.expired"
+	EventInvoiceSettled = "invoice.settled"
+	EventInvoiceExpired = "invoice.expired"
 )
 
-// Event is the standardized JSON payload sent to merchant webhook endpoints.
-type Event struct {
-	ID        string          `json:"id"`
-	Type      EventType       `json:"type"`
-	CreatedAt time.Time       `json:"created_at"`
-	Invoice   *domain.Invoice `json:"invoice"`
-	TxHash    string          `json:"tx_hash,omitempty"`
+var (
+	ErrInvalidSignatureHeader = errors.New("invalid signature header format")
+	ErrSignatureMismatch      = errors.New("signature mismatch")
+	ErrTimestampExpired       = errors.New("webhook timestamp outside tolerance window")
+)
+
+type EventPayload struct {
+	ID        string      `json:"id"`
+	Event     string      `json:"event"`
+	CreatedAt int64       `json:"created_at"`
+	Data      interface{} `json:"data"`
 }
 
-// HTTPClient abstracts the HTTP transport for deterministic testing.
-type HTTPClient interface {
-	Do(req *http.Request) (*http.Response, error)
-}
-
-// Config holds configuration parameters for the Webhook Dispatcher.
-type Config struct {
-	WebhookSecret string
-	MaxRetries    int
-	InitialDelay  time.Duration
-	HTTPClient    HTTPClient
-	Logger        *slog.Logger
-}
-
-// Dispatcher manages reliable, HMAC-signed webhook delivery to merchant servers.
-type Dispatcher struct {
-	cfg        Config
-	httpClient HTTPClient
-	logger     *slog.Logger
-	queue      chan Event
-	wg         sync.WaitGroup
-	stopChan   chan struct{}
-}
-
-// NewDispatcher constructs and validates a new Dispatcher.
-func NewDispatcher(cfg Config) (*Dispatcher, error) {
-	if cfg.WebhookSecret == "" {
-		return nil, fmt.Errorf("%w: webhook secret is required", ErrInvalidWebhookConfig)
-	}
-	if cfg.MaxRetries <= 0 {
-		cfg.MaxRetries = 3
-	}
-	if cfg.InitialDelay <= 0 {
-		cfg.InitialDelay = 500 * time.Millisecond
-	}
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Timeout: 10 * time.Second}
-	}
-	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
-	}
-
-	d := &Dispatcher{
-		cfg:        cfg,
-		httpClient: cfg.HTTPClient,
-		logger:     cfg.Logger.With("component", "webhook.dispatcher"),
-		queue:      make(chan Event, 256),
-		stopChan:   make(chan struct{}),
-	}
-
-	return d, nil
-}
-
-// Sign generates an HMAC-SHA256 signature for the given payload and timestamp.
-// Signature format: hex(HMAC-SHA256(secret, "t=" + timestamp + "." + body))
-func Sign(payload []byte, secret string, timestamp int64) string {
+// Sign computes the HMAC-SHA256 signature for a payload and timestamp.
+func Sign(payload []byte, timestamp int64, secret string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
-	signedData := fmt.Sprintf("t=%d.", timestamp)
-	mac.Write([]byte(signedData))
+	mac.Write([]byte(fmt.Sprintf("%d.", timestamp)))
 	mac.Write(payload)
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// DispatchSync sends an event immediately to the invoice's WebhookURL with exponential backoff.
-func (d *Dispatcher) DispatchSync(ctx context.Context, event Event) error {
-	if event.Invoice == nil || event.Invoice.WebhookURL == "" {
-		d.logger.DebugContext(ctx, "no webhook url configured for invoice; skipping dispatch",
-			"invoice_id", event.Invoice.ID,
-		)
-		return nil
+// VerifySignature validates a webhook signature header against expected secret and tolerance window.
+func VerifySignature(payload []byte, sigHeader string, secret string, tolerance time.Duration) error {
+	parts := strings.Split(sigHeader, ",")
+	if len(parts) != 2 {
+		return ErrInvalidSignatureHeader
 	}
 
-	payload, err := json.Marshal(event)
+	timePart := strings.TrimPrefix(parts[0], "t=")
+	sigPart := strings.TrimPrefix(parts[1], "v1=")
+
+	ts, err := strconv.ParseInt(timePart, 10, 64)
 	if err != nil {
-		return fmt.Errorf("marshal webhook event: %w", err)
+		return ErrInvalidSignatureHeader
 	}
 
-	url := event.Invoice.WebhookURL
-	timestamp := time.Now().UTC().Unix()
-	signature := Sign(payload, d.cfg.WebhookSecret, timestamp)
+	if tolerance > 0 {
+		now := time.Now().Unix()
+		if now-ts > int64(tolerance.Seconds()) || ts-now > int64(tolerance.Seconds()) {
+			return ErrTimestampExpired
+		}
+	}
 
-	delay := d.cfg.InitialDelay
+	expected := Sign(payload, ts, secret)
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(sigPart)) != 1 {
+		return ErrSignatureMismatch
+	}
 
-	for attempt := 1; attempt <= d.cfg.MaxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-		if err != nil {
-			return fmt.Errorf("create webhook request: %w", err)
+	return nil
+}
+
+type Dispatcher struct {
+	secret     string
+	httpClient *http.Client
+	wg         sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+func NewDispatcher(secret string, timeout time.Duration) *Dispatcher {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Dispatcher{
+		secret: secret,
+		httpClient: &http.Client{
+			Timeout: timeout,
+		},
+		ctx:    ctx,
+		cancel: cancel,
+	}
+}
+
+func (d *Dispatcher) Stop() {
+	d.cancel()
+	d.wg.Wait()
+}
+
+func (d *Dispatcher) DispatchAsync(targetURL string, event string, data interface{}) {
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		if err := d.DispatchWithRetry(d.ctx, targetURL, event, data, 3); err != nil {
+			slog.Warn("webhook delivery exhausted all retries", "url", targetURL, "event", event, "err", err)
+		}
+	}()
+}
+
+func (d *Dispatcher) DispatchWithRetry(ctx context.Context, targetURL string, event string, data interface{}, maxRetries int) error {
+	payload := EventPayload{
+		ID:        fmt.Sprintf("evt_%d", time.Now().UnixNano()),
+		Event:     event,
+		CreatedAt: time.Now().Unix(),
+		Data:      data,
+	}
+
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed encoding webhook payload: %w", err)
+	}
+
+	backoff := 1 * time.Second
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "xrpay-gateway/1.0")
-		req.Header.Set("X-XRPay-Signature", signature)
-		req.Header.Set("X-XRPay-Timestamp", fmt.Sprintf("%d", timestamp))
-		req.Header.Set("X-XRPay-Event", string(event.Type))
-
-		resp, err := d.httpClient.Do(req)
+		err = d.send(ctx, targetURL, bodyBytes, payload.CreatedAt)
 		if err == nil {
-			// Drain and close response body to reuse connections
-			_, _ = io.Copy(io.Discard, resp.Body)
-			_ = resp.Body.Close()
-
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				d.logger.InfoContext(ctx, "webhook delivered successfully",
-					"invoice_id", event.Invoice.ID,
-					"event_type", event.Type,
-					"url", url,
-					"attempt", attempt,
-					"status_code", resp.StatusCode,
-				)
-				return nil
-			}
-
-			d.logger.WarnContext(ctx, "webhook endpoint returned non-2xx status",
-				"invoice_id", event.Invoice.ID,
-				"url", url,
-				"status_code", resp.StatusCode,
-				"attempt", attempt,
-			)
-		} else {
-			d.logger.WarnContext(ctx, "webhook network error",
-				"invoice_id", event.Invoice.ID,
-				"url", url,
-				"error", err,
-				"attempt", attempt,
-			)
+			slog.Info("webhook delivered successfully", "url", targetURL, "event", event, "attempt", attempt)
+			return nil
 		}
 
-		if attempt < d.cfg.MaxRetries {
+		slog.Warn("webhook delivery attempt failed", "url", targetURL, "attempt", attempt, "err", err)
+
+		if attempt < maxRetries {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(delay):
-				delay *= 2 // Exponential backoff
+			case <-time.After(backoff):
+				backoff *= 2
 			}
 		}
 	}
 
-	return fmt.Errorf("%w: %s (attempts: %d)", ErrDeliveryFailed, url, d.cfg.MaxRetries)
+	return fmt.Errorf("failed after %d attempts: %w", maxRetries, err)
+}
+
+func (d *Dispatcher) send(ctx context.Context, targetURL string, body []byte, timestamp int64) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+
+	sig := Sign(body, timestamp, d.secret)
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "xrpay-webhook-engine/1.0")
+	req.Header.Set("X-XRPAY-SIGNATURE", fmt.Sprintf("t=%d,v1=%s", timestamp, sig))
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("webhook endpoint returned status %d", resp.StatusCode)
+	}
+
+	return nil
 }

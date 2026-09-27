@@ -5,214 +5,176 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 )
 
-// Status represents the finite state of an invoice.
-type Status string
+var (
+	ErrInvoiceNotFound        = errors.New("invoice not found")
+	ErrInvalidInvoiceAmount   = errors.New("invoice amount must be strictly positive")
+	ErrInvoiceExpired         = errors.New("invoice has expired")
+	ErrInvoiceAlreadySettled   = errors.New("invoice is already settled")
+	ErrInvoiceTerminalState   = errors.New("invoice is in a terminal state")
+	ErrOptimisticLockConflict = errors.New("optimistic lock conflict: version mismatch")
+	ErrMetadataLimitExceeded  = errors.New("metadata limit exceeded")
+)
+
+type InvoiceStatus string
 
 const (
-	StatusPending       Status = "pending"        // Awaiting transaction on XRPL
-	StatusDetected      Status = "detected"       // Seen on network, awaiting validated ledger
-	StatusPartiallyPaid Status = "partially_paid" // Received payment, but below amount expected
-	StatusSettled       Status = "settled"        // Full payment validated in a closed ledger (final)
-	StatusOverpaid      Status = "overpaid"       // Validated, but customer sent more than requested
-	StatusExpired       Status = "expired"        // Timed out before full payment
-	StatusCanceled      Status = "canceled"       // Canceled by merchant
+	StatusPending       InvoiceStatus = "PENDING"
+	StatusPartiallyPaid InvoiceStatus = "PARTIALLY_PAID"
+	StatusSettled       InvoiceStatus = "SETTLED"
+	StatusOverpaid      InvoiceStatus = "OVERPAID"
+	StatusExpired       InvoiceStatus = "EXPIRED"
+	StatusCancelled     InvoiceStatus = "CANCELLED"
+	StatusRefunded      InvoiceStatus = "REFUNDED"
 )
 
-var (
-	ErrInvalidAddress    = errors.New("invalid merchant XRPL address (must start with 'r')")
-	ErrInvalidTag        = errors.New("destination tag cannot be zero")
-	ErrInvalidDuration   = errors.New("invoice expiration duration must be positive")
-	ErrInvalidMetadata   = errors.New("invalid invoice metadata") 
-	ErrIllegalTransition = errors.New("illegal invoice status transition")
-	ErrEmptyTxHash       = errors.New("tx hash cannot be empty on settlement")
-	ErrNegativePayment   = errors.New("payment amount cannot be negative")
-)
-
-// Invoice represents a robust payment request tied to a unique DestinationTag.
-type Invoice struct {
-	ID             string            `json:"id"`
-	OrderID        string            `json:"order_id,omitempty"`       // Merchant's internal reference ID
-	MerchantAddr   string            `json:"merchant_address"`
-	DestinationTag uint32            `json:"destination_tag"`
-	AmountExpected Drops             `json:"amount_expected_drops"`
-	AmountPaid     Drops             `json:"amount_paid_drops"`        // Actual drops received so far
-	Status         Status            `json:"status"`
-	TxHash         string            `json:"tx_hash,omitempty"`
-	WebhookURL     string            `json:"webhook_url,omitempty"`
-	Metadata       map[string]string `json:"metadata,omitempty"`
-	Version        int64             `json:"version"`                  // Optimistic concurrency counter
-	CreatedAt      time.Time         `json:"created_at"`
-	ExpiresAt      time.Time         `json:"expires_at"`
-	SettledAt      *time.Time        `json:"settled_at,omitempty"`
+func (s InvoiceStatus) IsTerminal() bool {
+	switch s {
+	case StatusSettled, StatusOverpaid, StatusExpired, StatusCancelled, StatusRefunded:
+		return true
+	default:
+		return false
+	}
 }
 
-// NewInvoice creates a hardened pending invoice.
+// PaymentRecord captures an individual on-chain payment event.
+type PaymentRecord struct {
+	TxHash         string    `json:"tx_hash"`
+	DeliveredDrops Drops     `json:"delivered_drops"`
+	DeliveredXRP   string    `json:"delivered_xrp"`
+	Timestamp      time.Time `json:"timestamp"`
+}
+
+// Invoice represents a merchant billing request settled via XRPL.
+type Invoice struct {
+	ID              string            `json:"id"`
+	OrderID         string            `json:"order_id"`
+	MerchantAddress string            `json:"merchant_address"`
+	DestinationTag  uint32            `json:"destination_tag"`
+	AmountDrops     Drops             `json:"amount_drops"`
+	AmountXRP       string            `json:"amount_xrp"`
+	PaidDrops       Drops             `json:"paid_drops"`
+	PaidXRP         string            `json:"paid_xrp"`
+	Status          InvoiceStatus     `json:"status"`
+	RedirectURL     string            `json:"redirect_url,omitempty"`
+	WebhookURL      string            `json:"webhook_url,omitempty"`
+	Metadata        map[string]string `json:"metadata,omitempty"`
+	TxHash          string            `json:"tx_hash,omitempty"`
+	Payments        []PaymentRecord   `json:"payments,omitempty"`
+	CreatedAt       time.Time         `json:"created_at"`
+	ExpiresAt       time.Time         `json:"expires_at"`
+	SettledAt       *time.Time        `json:"settled_at,omitempty"`
+	Version         uint64            `json:"version"`
+}
+
+// IsTerminal checks if the invoice has reached a final state.
+func (inv *Invoice) IsTerminal() bool {
+	return inv.Status.IsTerminal()
+}
+
+// NewInvoice creates a new pending invoice.
 func NewInvoice(
 	orderID string,
 	merchantAddr string,
-	tag uint32,
+	destTag uint32,
 	amount Drops,
-	duration time.Duration,
+	expiry time.Duration,
+	now time.Time,
+	redirectURL string,
 	webhookURL string,
 	metadata map[string]string,
 ) (*Invoice, error) {
-	merchantAddr = strings.TrimSpace(merchantAddr)
-	if err := ValidateXRPLAddress(merchantAddr); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidAddress, err)
-	}
-	if tag == 0 {
-		return nil, ErrInvalidTag
-	}
 	if amount <= 0 {
-		return nil, ErrInvalidAmount
+		return nil, ErrInvalidInvoiceAmount
 	}
-	if duration <= 0 {
-		return nil, ErrInvalidDuration
+
+	if err := ValidateXRPLAddress(merchantAddr); err != nil {
+		return nil, fmt.Errorf("invalid merchant address: %w", err)
 	}
+
 	if len(metadata) > 20 {
-		return nil, fmt.Errorf("%w: metadata cannot exceed 20 keys", ErrInvalidMetadata)
+		return nil, fmt.Errorf("%w: max 20 keys allowed", ErrMetadataLimitExceeded)
 	}
 	for k, v := range metadata {
 		if len(k) > 64 || len(v) > 500 {
-			return nil, fmt.Errorf("%w: metadata key/value exceeds size limits", ErrInvalidMetadata)
+			return nil, fmt.Errorf("%w: key max 64 chars, value max 500 chars", ErrMetadataLimitExceeded)
 		}
 	}
 
-	if tag == 0 {
-		return nil, ErrInvalidTag
+	idBytes := make([]byte, 8)
+	if _, err := rand.Read(idBytes); err != nil {
+		return nil, fmt.Errorf("failed generating invoice id: %w", err)
 	}
 
-	if amount <= 0 {
-		return nil, ErrAmountTooSmall
-	}
-
-	if duration <= 0 {
-		return nil, ErrInvalidDuration
-	}
-
-	id, err := generateInvoiceID()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate invoice id: %w", err)
-	}
-
-	now := time.Now().UTC()
 	return &Invoice{
-		ID:             id,
-		OrderID:        strings.TrimSpace(orderID),
-		MerchantAddr:   merchantAddr,
-		DestinationTag: tag,
-		AmountExpected: amount,
-		AmountPaid:     0,
-		Status:         StatusPending,
-		WebhookURL:     strings.TrimSpace(webhookURL),
-		Metadata:       metadata,
-		Version:        1,
-		CreatedAt:      now,
-		ExpiresAt:      now.Add(duration),
+		ID:              fmt.Sprintf("inv_%s", hex.EncodeToString(idBytes)),
+		OrderID:         orderID,
+		MerchantAddress: merchantAddr,
+		DestinationTag:  destTag,
+		AmountDrops:     amount,
+		AmountXRP:       amount.ToXRPString(),
+		PaidDrops:       0,
+		PaidXRP:         Drops(0).ToXRPString(),
+		Status:          StatusPending,
+		RedirectURL:     redirectURL,
+		WebhookURL:      webhookURL,
+		Metadata:        metadata,
+		Payments:        make([]PaymentRecord, 0),
+		CreatedAt:       now,
+		ExpiresAt:       now.Add(expiry),
+		Version:         1,
 	}, nil
 }
 
-// ApplyPayment records an incoming validated payment on XRPL and transitions state accurately.
-func (inv *Invoice) ApplyPayment(deliveredAmount Drops, txHash string, settledAt time.Time) error {
-	txHash = strings.TrimSpace(txHash)
-	if txHash == "" {
-		return ErrEmptyTxHash
-	}
-	if deliveredAmount <= 0 {
-		return ErrNegativePayment
+// ApplyPayment transitions invoice state on payment receipt.
+func (inv *Invoice) ApplyPayment(deliveredDrops Drops, txHash string, receivedAt time.Time) error {
+	if inv.Status.IsTerminal() {
+		return fmt.Errorf("%w: cannot apply payment to invoice in status %s", ErrInvoiceTerminalState, inv.Status)
 	}
 
-	if inv.Status == StatusSettled || inv.Status == StatusOverpaid {
-		return fmt.Errorf("%w: invoice is already finalized", ErrIllegalTransition)
+	if receivedAt.After(inv.ExpiresAt) {
+		inv.Status = StatusExpired
+		return ErrInvoiceExpired
 	}
 
-	if settledAt.IsZero() {
-		settledAt = time.Now().UTC()
-	}
-
-	inv.AmountPaid += deliveredAmount
+	inv.PaidDrops += deliveredDrops
+	inv.PaidXRP = inv.PaidDrops.ToXRPString()
 	inv.TxHash = txHash
-	inv.Version++
 
-	if inv.AmountPaid == inv.AmountExpected {
-		inv.Status = StatusSettled
-		inv.SettledAt = &settledAt
-	} else if inv.AmountPaid > inv.AmountExpected {
-		inv.Status = StatusOverpaid
-		inv.SettledAt = &settledAt
-	} else {
+	// Record payment in ledger audit history
+	inv.Payments = append(inv.Payments, PaymentRecord{
+		TxHash:         txHash,
+		DeliveredDrops: deliveredDrops,
+		DeliveredXRP:   deliveredDrops.ToXRPString(),
+		Timestamp:      receivedAt,
+	})
+
+	if inv.PaidDrops >= inv.AmountDrops {
+		if inv.PaidDrops > inv.AmountDrops {
+			inv.Status = StatusOverpaid
+		} else {
+			inv.Status = StatusSettled
+		}
+		inv.SettledAt = &receivedAt
+	} else if inv.PaidDrops > 0 {
 		inv.Status = StatusPartiallyPaid
 	}
 
-	return nil
-}
-
-// MarkDetected transitions the invoice to detected when seen in the mempool.
-func (inv *Invoice) MarkDetected(txHash string) error {
-	txHash = strings.TrimSpace(txHash)
-	if txHash == "" {
-		return ErrEmptyTxHash
-	}
-
-	if inv.Status != StatusPending && inv.Status != StatusPartiallyPaid {
-		return fmt.Errorf("%w: cannot mark %s as detected", ErrIllegalTransition, inv.Status)
-	}
-
-	inv.Status = StatusDetected
-	inv.TxHash = txHash
 	inv.Version++
 	return nil
 }
 
-// MarkExpired expires an unpaid or partially-paid invoice whose timer elapsed.
-func (inv *Invoice) MarkExpired(now time.Time) error {
-	if inv.Status == StatusSettled || inv.Status == StatusOverpaid {
-		return fmt.Errorf("%w: settled invoices cannot expire", ErrIllegalTransition)
+// Expire marks an open invoice as expired if current time is past expiry.
+func (inv *Invoice) Expire(now time.Time) bool {
+	if inv.Status.IsTerminal() {
+		return false
 	}
-
-	if inv.Status == StatusExpired || inv.Status == StatusCanceled {
-		return nil // idempotent
+	if now.After(inv.ExpiresAt) {
+		inv.Status = StatusExpired
+		inv.Version++
+		return true
 	}
-
-	inv.Status = StatusExpired
-	inv.Version++
-	return nil
-}
-
-// MarkCanceled voids a pending invoice.
-func (inv *Invoice) MarkCanceled() error {
-	if inv.Status == StatusSettled || inv.Status == StatusOverpaid {
-		return fmt.Errorf("%w: settled invoices cannot be canceled", ErrIllegalTransition)
-	}
-
-	if inv.Status != StatusPending && inv.Status != StatusPartiallyPaid {
-		return fmt.Errorf("%w: cannot cancel invoice with status %s", ErrIllegalTransition, inv.Status)
-	}
-
-	inv.Status = StatusCanceled
-	inv.Version++
-	return nil
-}
-
-// IsTerminal returns true if the invoice has reached an immutable end state.
-func (inv *Invoice) IsTerminal() bool {
-	return inv.Status == StatusSettled || inv.Status == StatusOverpaid || inv.Status == StatusExpired || inv.Status == StatusCanceled
-}
-
-// IsExpired checks if the current time exceeds the expiration timestamp.
-func (inv *Invoice) IsExpired(now time.Time) bool {
-	return now.After(inv.ExpiresAt) && !inv.IsTerminal()
-}
-
-// generateInvoiceID generates a secure prefix + 16-hex character ID: "inv_4a9b81f01c2d3e4f".
-func generateInvoiceID() (string, error) {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return "inv_" + hex.EncodeToString(b), nil
+	return false
 }

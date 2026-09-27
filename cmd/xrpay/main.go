@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,7 +20,6 @@ import (
 	"github.com/psiloconvalley/xrpay/internal/xrpl"
 )
 
-// AppConfig holds environment-driven configuration for xrpay daemon.
 type AppConfig struct {
 	Port            string
 	MerchantAccount string
@@ -40,13 +40,12 @@ func loadConfig() AppConfig {
 
 	merchantAddr := os.Getenv("XRPAY_MERCHANT_ADDR")
 	if merchantAddr == "" {
-		// Default public testnet test faucet account for development
 		merchantAddr = "rwD1bRFNqjyxPqcSkje5UuBYttqLf7Q92V"
 	}
 
 	rpcURL := os.Getenv("XRPAY_RPC_URL")
 	if rpcURL == "" {
-		rpcURL = xrpl.TestnetRPCURL
+		rpcURL = "https://s.altnet.rippletest.net:51234"
 	}
 
 	secret := os.Getenv("XRPAY_WEBHOOK_SECRET")
@@ -93,7 +92,6 @@ func loadConfig() AppConfig {
 	}
 }
 
-// Validate checks the runtime configuration against strict production requirements.
 func (c AppConfig) Validate() error {
 	if err := domain.ValidateXRPLAddress(c.MerchantAccount); err != nil {
 		return fmt.Errorf("invalid merchant address: %w", err)
@@ -113,7 +111,6 @@ func (c AppConfig) Validate() error {
 }
 
 func main() {
-	// 1. Initialize structured JSON logger (Charter §1.2)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -129,83 +126,54 @@ func main() {
 		"poll_interval", cfg.PollInterval.String(),
 	)
 
-	// Validate config before doing any work
 	if err := cfg.Validate(); err != nil {
 		logger.Error("startup configuration validation failed", "error", err)
 		os.Exit(1)
 	}
 
-	// 2. Initialize Store
-	memStore := store.NewMemoryStore()
+	// 1. Store
+	memStore := store.NewMemoryStore(1000)
 
-	// 3. Initialize Webhook Dispatcher
-	dispatcher, err := webhook.NewDispatcher(webhook.Config{
-		WebhookSecret: cfg.WebhookSecret,
-		MaxRetries:    3,
-		InitialDelay:  500 * time.Millisecond,
-		Logger:        logger,
-	})
-	if err != nil {
-		logger.Error("failed to initialize webhook dispatcher", "error", err)
-		os.Exit(1)
-	}
+	// 2. Webhook Dispatcher
+	dispatcher := webhook.NewDispatcher(cfg.WebhookSecret, 10*time.Second)
 
-	// 4. Initialize XRPL Client & Poller
-	xrplClient := xrpl.NewClient(cfg.RPCURL)
+	// 3. XRPL Client & Poller
+	xrplClient := xrpl.NewClient(cfg.RPCURL, 10*time.Second)
+	poller := xrpl.NewPoller(xrplClient, memStore, dispatcher, cfg.MerchantAccount, cfg.PollInterval, cfg.StartLedger)
 
-	poller, err := xrpl.NewPoller(xrplClient, memStore, xrpl.PollerConfig{
-		MerchantAccount: cfg.MerchantAccount,
-		PollInterval:    cfg.PollInterval,
-		StartLedger:     cfg.StartLedger,
-		Logger:          logger,
-		OnPayment: func(ctx context.Context, inv *domain.Invoice, event xrpl.PaymentEvent) {
-			eventType := webhook.EventInvoiceSettled
-			if inv.Status == domain.StatusPartiallyPaid {
-				eventType = webhook.EventInvoicePartiallyPaid
-			} else if inv.Status == domain.StatusOverpaid {
-				eventType = webhook.EventInvoiceOverpaid
-			}
-
-			webhookEvent := webhook.Event{
-				ID:        fmt.Sprintf("evt_%s_%d", inv.ID, time.Now().UnixNano()),
-				Type:      eventType,
-				CreatedAt: time.Now().UTC(),
-				Invoice:   inv,
-				TxHash:    event.TxHash,
-			}
-
-			// Fire webhook asynchronously so poller loop is not blocked
-			go func() {
-				dispatchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				if err := dispatcher.DispatchSync(dispatchCtx, webhookEvent); err != nil {
-					logger.ErrorContext(dispatchCtx, "webhook delivery failed", "error", err, "invoice_id", inv.ID)
-				}
-			}()
-		},
-	})
-	if err != nil {
-		logger.Error("failed to initialize poller", "error", err)
-		os.Exit(1)
-	}
-
-	// 5. Initialize API Handler & Routes
-	apiHandler, err := api.NewHandler(memStore, api.Config{
-		MerchantAccount: cfg.MerchantAccount,
-		BaseURL:         cfg.BaseURL,
-		APIKey:          cfg.APIKey,
-		DefaultDuration: 15 * time.Minute,
-		Logger:          logger,
-	})
-	if err != nil {
-		logger.Error("failed to initialize api handler", "error", err)
-		os.Exit(1)
-	}
+	// 4. API Handlers & Routes
+	apiHandler := api.NewHandler(memStore, cfg.MerchantAccount, 15*time.Minute)
 
 	mux := http.NewServeMux()
-	apiHandler.RegisterRoutes(mux)
 
-	// Logging & Recovery Middleware
+	// Health Check
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	// Checkout UI (Public)
+	mux.HandleFunc("/checkout/", apiHandler.CheckoutHandler)
+
+	// Invoice Status (Public Safe Endpoint)
+	mux.HandleFunc("/api/v1/invoices/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") && r.Method == http.MethodGet {
+			apiHandler.GetInvoicePublicStatusHandler(w, r)
+			return
+		}
+		if r.Method == http.MethodPost {
+			api.RequireAuth(cfg.APIKey, apiHandler.CreateInvoiceHandler).ServeHTTP(w, r)
+			return
+		}
+		if r.Method == http.MethodGet {
+			api.RequireAuth(cfg.APIKey, apiHandler.GetInvoiceHandler).ServeHTTP(w, r)
+			return
+		}
+				http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	})
+
+	// Global HTTP middleware
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		defer func() {
@@ -225,7 +193,6 @@ func main() {
 		)
 	})
 
-	// Wrap handler with CORS and Security Headers (Sweep 1)
 	securedHandler := api.SecurityHeadersMiddleware(api.CORSMiddleware(handler))
 
 	server := &http.Server{
@@ -236,16 +203,11 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// 6. Start Poller Background Worker
+	// Start Poller
 	pollerCtx, cancelPoller := context.WithCancel(context.Background())
-	defer cancelPoller()
+	poller.Start(pollerCtx)
 
-	if err := poller.Start(pollerCtx); err != nil {
-		logger.Error("failed to start poller", "error", err)
-		os.Exit(1)
-	}
-
-	// 7. Start HTTP Server in background goroutine
+	// Start HTTP Server
 	go func() {
 		logger.Info("HTTP server listening", "addr", server.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -254,18 +216,17 @@ func main() {
 		}
 	}()
 
-	// 8. Graceful Shutdown on OS signals
+	// Graceful Shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
 
 	logger.Info("shutdown signal received; commencing graceful shutdown")
 
-	// Stop poller worker
 	cancelPoller()
-	_ = poller.Stop()
+	poller.Stop()
+	dispatcher.Stop()
 
-	// Shutdown HTTP server with 10s deadline
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
@@ -275,3 +236,4 @@ func main() {
 		logger.Info("server exited cleanly")
 	}
 }
+

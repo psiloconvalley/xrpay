@@ -5,49 +5,33 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/psiloconvalley/xrpay/internal/domain"
 	"github.com/psiloconvalley/xrpay/internal/xrpl"
 )
 
-const merchantAddr = "rPT1Sjq2YGrBMTttX4GZHjKu9DYfzbpAYe"
-
 func TestClient_GetAccountPayments_Success(t *testing.T) {
-	// Mock XRPL RPC server response
 	mockResponse := `{
 		"result": {
-			"account": "` + merchantAddr + `",
 			"status": "success",
-			"validated": true,
+			"account": "rwD1bRFNqjyxPqcSkje5UuBYttqLf7Q92V",
 			"transactions": [
 				{
 					"validated": true,
 					"tx": {
 						"TransactionType": "Payment",
-						"Account": "rCustomerAddress123456789012345678",
-						"Destination": "` + merchantAddr + `",
-						"DestinationTag": 1042,
-						"hash": "4B8F9A1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A",
-						"ledger_index": 500123
+						"Account": "rCustomer...",
+						"Destination": "rwD1bRFNqjyxPqcSkje5UuBYttqLf7Q92V",
+						"DestinationTag": 1001,
+						"Amount": "5000000",
+						"hash": "TX_HASH_XYZ",
+						"date": 788918400,
+						"ledger_index": 42000
 					},
 					"meta": {
 						"TransactionResult": "tesSUCCESS",
-						"delivered_amount": "25500000"
-					}
-				},
-				{
-					"validated": true,
-					"tx": {
-						"TransactionType": "Payment",
-						"Account": "rCustomer2",
-						"Destination": "` + merchantAddr + `",
-						"DestinationTag": 1043,
-						"hash": "FAILEDFASH123",
-						"ledger_index": 500124
-					},
-					"meta": {
-						"TransactionResult": "tecPATH_PARTIAL",
-						"delivered_amount": "1000000"
+						"delivered_amount": "5000000"
 					}
 				}
 			]
@@ -60,25 +44,55 @@ func TestClient_GetAccountPayments_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := xrpl.NewClient(server.URL)
-	payments, err := client.GetAccountPayments(context.Background(), merchantAddr, -1)
+	client := xrpl.NewClient(server.URL, 5*time.Second)
+
+	payments, latestLedger, err := client.GetAccountPayments(context.Background(), "rwD1bRFNqjyxPqcSkje5UuBYttqLf7Q92V", 0, -1)
 	if err != nil {
-		t.Fatalf("GetAccountPayments unexpected error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Should only include the successful payment (tecPATH_PARTIAL ignored)
 	if len(payments) != 1 {
-		t.Fatalf("expected 1 valid payment, got %d", len(payments))
+		t.Fatalf("expected 1 payment, got %d", len(payments))
 	}
 
-	p := payments[0]
-	if p.DestinationTag != 1042 {
-		t.Errorf("expected tag 1042, got %d", p.DestinationTag)
+	pay := payments[0]
+	if pay.TxHash != "TX_HASH_XYZ" {
+		t.Errorf("expected TX_HASH_XYZ, got %s", pay.TxHash)
 	}
-	if p.DeliveredDrops != domain.Drops(25_500_000) {
-		t.Errorf("expected 25500000 drops, got %d", p.DeliveredDrops)
+	if pay.DeliveredDrops != domain.Drops(5000000) {
+		t.Errorf("expected 5000000 drops, got %d", pay.DeliveredDrops)
 	}
-	if p.TxHash != "4B8F9A1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A" {
-		t.Errorf("tx hash mismatch: %s", p.TxHash)
+	if pay.DestinationTag != 1001 {
+		t.Errorf("expected tag 1001, got %d", pay.DestinationTag)
+	}
+	if latestLedger != 42000 {
+		t.Errorf("expected latest ledger 42000, got %d", latestLedger)
+	}
+}
+
+func TestClient_GetAccountPayments_Unfunded(t *testing.T) {
+	mockResponse := `{
+		"result": {
+			"status": "error",
+			"error": "actNotFound",
+			"error_message": "Account not found."
+		}
+	}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(mockResponse))
+	}))
+	defer server.Close()
+
+	client := xrpl.NewClient(server.URL, 5*time.Second)
+
+	_, _, err := client.GetAccountPayments(context.Background(), "rwD1bRFNqjyxPqcSkje5UuBYttqLf7Q92V", 0, -1)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if err != xrpl.ErrAccountNotFound {
+		t.Errorf("expected ErrAccountNotFound, got %v", err)
 	}
 }

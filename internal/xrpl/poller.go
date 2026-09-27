@@ -3,290 +3,214 @@ package xrpl
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/psiloconvalley/xrpay/internal/domain"
 	"github.com/psiloconvalley/xrpay/internal/store"
+	"github.com/psiloconvalley/xrpay/internal/webhook"
 )
 
-// Sentinel errors for poller lifecycle and operations.
-var (
-	ErrPollerAlreadyRunning = errors.New("poller is already running")
-	ErrPollerNotRunning     = errors.New("poller is not running")
-	ErrInvalidConfig        = errors.New("invalid poller configuration")
-)
-
-// PaymentFetcher defines the XRPL client capabilities required by the Poller.
-// Following Charter §3.2 (interfaces defined in consumer packages).
-type PaymentFetcher interface {
-	GetAccountPayments(ctx context.Context, account string, minLedger int64) ([]PaymentEvent, error)
+// BoundedTxCache stores up to maxSize transaction hashes with FIFO eviction.
+type BoundedTxCache struct {
+	mu      sync.RWMutex
+	maxSize int
+	order   []string
+	set     map[string]struct{}
 }
 
-// InvoiceRepository defines the persistence capabilities required by the Poller.
-type InvoiceRepository interface {
-	GetByTag(ctx context.Context, merchantAddr string, tag uint32) (*domain.Invoice, error)
-	Update(ctx context.Context, inv *domain.Invoice) error
-	ListPending(ctx context.Context) ([]*domain.Invoice, error)
+// NewBoundedTxCache constructs a bounded in-memory cache for transaction deduplication.
+func NewBoundedTxCache(maxSize int) *BoundedTxCache {
+	if maxSize <= 0 {
+		maxSize = 10000
+	}
+	return &BoundedTxCache{
+		maxSize: maxSize,
+		order:   make([]string, 0, maxSize),
+		set:     make(map[string]struct{}, maxSize),
+	}
 }
 
-// PaymentListener is a callback invoked whenever an invoice changes status due to an on-chain payment.
-type PaymentListener func(ctx context.Context, inv *domain.Invoice, event PaymentEvent)
-
-// Clock abstracts time for deterministic testing without time.Sleep (Charter §2.2).
-type Clock interface {
-	Now() time.Time
+// Has checks whether the transaction hash has already been processed.
+func (c *BoundedTxCache) Has(hash string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, exists := c.set[hash]
+	return exists
 }
 
-type realClock struct{}
+// Add inserts a transaction hash, evicting the oldest entry when at capacity.
+func (c *BoundedTxCache) Add(hash string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-func (realClock) Now() time.Time { return time.Now().UTC() }
+	if _, exists := c.set[hash]; exists {
+		return
+	}
 
-// PollerConfig holds tunable configuration parameters for the ledger monitor.
-type PollerConfig struct {
-	MerchantAccount string
-	PollInterval    time.Duration
-	StartLedger     int64
-	Logger          *slog.Logger
-	Clock           Clock
-	OnPayment       PaymentListener
+	if len(c.order) >= c.maxSize {
+		oldest := c.order[0]
+		c.order = c.order[1:]
+		delete(c.set, oldest)
+	}
+
+	c.order = append(c.order, hash)
+	c.set[hash] = struct{}{}
 }
 
-// Poller runs a reconciliation loop between the XRPL ledger and the Invoice store.
+// Poller monitors ledger transactions for a merchant address and reconciles payments.
 type Poller struct {
-	fetcher     PaymentFetcher
-	store       InvoiceRepository
-	cfg         PollerConfig
-	logger      *slog.Logger
-	clock       Clock
-	lastLedger  int64 // accessed atomically
-	running     atomic.Bool
-	stopChan    chan struct{}
-	wg          sync.WaitGroup
-	mu          sync.Mutex
-	processedTx map[string]struct{}
+	client          *Client
+	store           store.InvoiceStore
+	dispatcher      *webhook.Dispatcher
+	merchantAddress string
+	pollInterval    time.Duration
+	lastLedger      int64
+	txCache         *BoundedTxCache
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
 }
 
-// NewPoller constructs and validates a new Poller instance.
-func NewPoller(fetcher PaymentFetcher, repo InvoiceRepository, cfg PollerConfig) (*Poller, error) {
-	if fetcher == nil {
-		return nil, fmt.Errorf("%w: fetcher cannot be nil", ErrInvalidConfig)
+// NewPoller constructs a new ledger polling worker.
+func NewPoller(
+	client *Client,
+	invoiceStore store.InvoiceStore,
+	dispatcher *webhook.Dispatcher,
+	merchantAddress string,
+	pollInterval time.Duration,
+	startLedger int64,
+) *Poller {
+	if pollInterval <= 0 {
+		pollInterval = 3 * time.Second
 	}
-	if repo == nil {
-		return nil, fmt.Errorf("%w: store cannot be nil", ErrInvalidConfig)
+	return &Poller{
+		client:          client,
+		store:           invoiceStore,
+		dispatcher:      dispatcher,
+		merchantAddress: merchantAddress,
+		pollInterval:    pollInterval,
+		lastLedger:      startLedger,
+		txCache:         NewBoundedTxCache(10000),
+		stopCh:          make(chan struct{}),
 	}
-	if err := domain.ValidateXRPLAddress(cfg.MerchantAccount); err != nil {
-		return nil, fmt.Errorf("%w: invalid merchant address %q: %v", ErrInvalidConfig, cfg.MerchantAccount, err)
-	}
-	if cfg.PollInterval <= 0 {
-		cfg.PollInterval = 3 * time.Second
-	}
-	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
-	}
-	if cfg.Clock == nil {
-		cfg.Clock = realClock{}
-	}
-
-	p := &Poller{
-		fetcher:     fetcher,
-		store:       repo,
-		cfg:         cfg,
-		logger:      cfg.Logger.With("component", "xrpl.poller", "merchant", cfg.MerchantAccount),
-		clock:       cfg.Clock,
-		lastLedger:  cfg.StartLedger,
-		stopChan:    make(chan struct{}),
-		processedTx: make(map[string]struct{}),
-	}
-
-	return p, nil
 }
 
-// LastLedger returns the highest validated ledger index processed so far.
-func (p *Poller) LastLedger() int64 {
-	return atomic.LoadInt64(&p.lastLedger)
+// Start spawns the poller background worker goroutine.
+func (p *Poller) Start(ctx context.Context) {
+	p.wg.Add(1)
+	go p.run(ctx)
 }
 
-// PollOnce executes a single reconciliation cycle:
-// 1. Fetches on-chain payments since lastLedger.
-// 2. Matches destination tags to active invoices and applies payments.
-// 3. Sweeps and expires stale pending invoices.
-func (p *Poller) PollOnce(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// Stop signals the poller to terminate and waits for the run loop to finish.
+func (p *Poller) Stop() {
+	close(p.stopCh)
+	p.wg.Wait()
+}
 
-	currentMinLedger := atomic.LoadInt64(&p.lastLedger)
+func (p *Poller) run(ctx context.Context) {
+	defer p.wg.Done()
 
-	// 1. Fetch on-chain payments
-	payments, err := p.fetcher.GetAccountPayments(ctx, p.cfg.MerchantAccount, currentMinLedger)
+	ticker := time.NewTicker(p.pollInterval)
+	sweepTicker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	defer sweepTicker.Stop()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := p.reconcile(ctx); err != nil {
+				if errors.Is(err, ErrAccountNotFound) {
+					slog.Debug("merchant account unfunded on ledger", "address", p.merchantAddress)
+				} else {
+					slog.Error("ledger reconciliation error", "err", err)
+				}
+			}
+		case <-sweepTicker.C:
+			p.sweepExpired(ctx)
+		}
+	}
+}
+
+func (p *Poller) reconcile(ctx context.Context) error {
+	payments, latestLedger, err := p.client.GetAccountPayments(ctx, p.merchantAddress, p.lastLedger, -1)
 	if err != nil {
-		p.logger.ErrorContext(ctx, "failed to fetch ledger payments", "error", err, "min_ledger", currentMinLedger)
-		return fmt.Errorf("fetch payments: %w", err)
+		return err
 	}
 
-	var maxLedgerSeen int64 = currentMinLedger
+	if latestLedger > p.lastLedger {
+		p.lastLedger = latestLedger
+	}
 
-	// 2. Reconcile payments against invoices
 	for _, payment := range payments {
-		if int64(payment.LedgerIndex) > maxLedgerSeen {
-			maxLedgerSeen = int64(payment.LedgerIndex)
-		}
-
-		// Skip if transaction was already processed by this poller instance
-		if _, exists := p.processedTx[payment.TxHash]; exists {
-			continue
-		}
-
-		// Destination tag 0 means untagged payment to merchant root account
 		if payment.DestinationTag == 0 {
-			p.logger.WarnContext(ctx, "received untagged payment to merchant wallet; skipping invoice match",
-				"tx_hash", payment.TxHash,
-				"drops", payment.DeliveredDrops,
-			)
-			p.processedTx[payment.TxHash] = struct{}{}
 			continue
 		}
 
-		inv, err := p.store.GetByTag(ctx, payment.Destination, payment.DestinationTag)
+		if p.txCache.Has(payment.TxHash) {
+			continue
+		}
+
+		inv, err := p.store.GetByTag(ctx, p.merchantAddress, payment.DestinationTag)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
-				p.logger.DebugContext(ctx, "payment tag not matched to active invoice",
-					"tag", payment.DestinationTag,
-					"tx_hash", payment.TxHash,
-				)
-				p.processedTx[payment.TxHash] = struct{}{}
 				continue
 			}
-			p.logger.ErrorContext(ctx, "store lookup failed for tag", "tag", payment.DestinationTag, "error", err)
+			slog.Error("store lookup error for destination tag", "tag", payment.DestinationTag, "err", err)
 			continue
 		}
 
-		// If invoice already reached terminal state before this payment
-		if inv.IsTerminal() {
-			p.logger.WarnContext(ctx, "payment received for already terminal invoice",
-				"invoice_id", inv.ID,
-				"status", inv.Status,
-				"tx_hash", payment.TxHash,
-			)
-			p.processedTx[payment.TxHash] = struct{}{}
+		if inv.Status.IsTerminal() {
+			p.txCache.Add(payment.TxHash)
 			continue
 		}
 
-		// Apply payment to domain state machine
-		now := p.clock.Now()
-		if applyErr := inv.ApplyPayment(payment.DeliveredDrops, payment.TxHash, now); applyErr != nil {
-			p.logger.ErrorContext(ctx, "failed to apply payment to invoice",
-				"invoice_id", inv.ID,
-				"error", applyErr,
-			)
+		if err := inv.ApplyPayment(payment.DeliveredDrops, payment.TxHash, payment.Timestamp); err != nil {
+			slog.Warn("failed applying payment to invoice", "invoice_id", inv.ID, "err", err)
 			continue
 		}
 
-		// Persist state change with optimistic concurrency control
-		if updateErr := p.store.Update(ctx, inv); updateErr != nil {
-			p.logger.ErrorContext(ctx, "failed to persist invoice state update",
-				"invoice_id", inv.ID,
-				"error", updateErr,
-			)
+		if err := p.store.Update(ctx, inv); err != nil {
+			slog.Error("failed updating invoice after payment", "invoice_id", inv.ID, "err", err)
 			continue
 		}
 
-		p.processedTx[payment.TxHash] = struct{}{}
-		p.logger.InfoContext(ctx, "invoice payment processed successfully",
+		p.txCache.Add(payment.TxHash)
+
+		slog.Info("payment reconciled",
 			"invoice_id", inv.ID,
-			"order_id", inv.OrderID,
-			"new_status", inv.Status,
-			"amount_paid", inv.AmountPaid.String(),
+			"status", inv.Status,
+			"tag", inv.DestinationTag,
+			"paid_drops", inv.PaidDrops,
 			"tx_hash", payment.TxHash,
 		)
 
-		// Fire listener (for Webhook Dispatcher in Phase 3)
-		if p.cfg.OnPayment != nil {
-			p.cfg.OnPayment(ctx, inv, payment)
-		}
-	}
-
-	// Advance ledger bookmark if we saw new validated ledgers
-	if maxLedgerSeen > currentMinLedger {
-		atomic.StoreInt64(&p.lastLedger, maxLedgerSeen)
-	}
-
-	// 3. Sweep and expire overdue pending invoices
-	now := p.clock.Now()
-	pendingInvoices, err := p.store.ListPending(ctx)
-	if err != nil {
-		p.logger.ErrorContext(ctx, "failed to list pending invoices for expiration sweep", "error", err)
-		return fmt.Errorf("list pending invoices: %w", err)
-	}
-
-	for _, inv := range pendingInvoices {
-		if inv.IsExpired(now) {
-			if expireErr := inv.MarkExpired(now); expireErr != nil {
-				p.logger.ErrorContext(ctx, "failed to mark invoice expired", "invoice_id", inv.ID, "error", expireErr)
-				continue
-			}
-			if updateErr := p.store.Update(ctx, inv); updateErr != nil {
-				p.logger.ErrorContext(ctx, "failed to update expired invoice", "invoice_id", inv.ID, "error", updateErr)
-				continue
-			}
-			p.logger.InfoContext(ctx, "invoice marked expired",
-				"invoice_id", inv.ID,
-				"order_id", inv.OrderID,
-				"expired_at", now,
-			)
+		if p.dispatcher != nil && inv.WebhookURL != "" {
+			p.dispatcher.DispatchAsync(inv.WebhookURL, webhook.EventInvoiceSettled, inv)
 		}
 	}
 
 	return nil
 }
 
-// Start launches the background polling goroutine.
-// It returns immediately and runs until Stop is called or ctx is canceled.
-func (p *Poller) Start(ctx context.Context) error {
-	if !p.running.CompareAndSwap(false, true) {
-		return ErrPollerAlreadyRunning
+func (p *Poller) sweepExpired(ctx context.Context) {
+	invoices, err := p.store.ListPending(ctx)
+	if err != nil {
+		return
 	}
 
-	p.wg.Add(1)
-	go func() {
-		defer p.wg.Done()
-		defer p.running.Store(false)
-
-		ticker := time.NewTicker(p.cfg.PollInterval)
-		defer ticker.Stop()
-
-		p.logger.Info("ledger poller started", "poll_interval", p.cfg.PollInterval)
-
-		for {
-			select {
-			case <-ctx.Done():
-				p.logger.Info("poller stopping due to context cancellation")
-				return
-			case <-p.stopChan:
-				p.logger.Info("poller stopping due to explicit stop signal")
-				return
-			case <-ticker.C:
-				if err := p.PollOnce(ctx); err != nil {
-					p.logger.ErrorContext(ctx, "reconciliation pass encountered error", "error", err)
+	now := time.Now().UTC()
+	for _, inv := range invoices {
+		if inv.Expire(now) {
+			if err := p.store.Update(ctx, inv); err == nil {
+				slog.Info("invoice expired during sweep", "invoice_id", inv.ID)
+				if p.dispatcher != nil && inv.WebhookURL != "" {
+					p.dispatcher.DispatchAsync(inv.WebhookURL, webhook.EventInvoiceExpired, inv)
 				}
 			}
 		}
-	}()
-
-	return nil
-}
-
-// Stop gracefully signals the poller to terminate and waits for the worker goroutine to exit.
-func (p *Poller) Stop() error {
-	if !p.running.Load() {
-		return ErrPollerNotRunning
 	}
-
-	close(p.stopChan)
-	p.wg.Wait()
-	p.logger.Info("ledger poller stopped cleanly")
-	return nil
 }

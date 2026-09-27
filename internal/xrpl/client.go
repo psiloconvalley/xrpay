@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -13,57 +14,53 @@ import (
 	"github.com/psiloconvalley/xrpay/internal/domain"
 )
 
-// Public XRPL Endpoints
-const (
-	TestnetRPCURL = "https://s.altnet.rippletest.net:51234"
-	MainnetRPCURL = "https://xrplcluster.com"
-)
-
 var (
 	ErrRPCRequestFailed  = errors.New("xrpl rpc request failed")
-	ErrAccountNotFound   = errors.New("account not found on xrpl")
-	ErrTransactionFailed = errors.New("transaction did not succeed on ledger")
+	ErrAccountNotFound   = errors.New("xrpl account not found (unfunded)")
+	ErrMalformedResponse = errors.New("malformed response from xrpl node")
 )
 
-// PaymentEvent represents a verified incoming payment extracted from the ledger.
-type PaymentEvent struct {
-	TxHash         string
-	Sender         string
-	Destination    string
-	DestinationTag uint32
-	DeliveredDrops domain.Drops
-	LedgerIndex    uint32
-	Validated      bool
-}
-
-// Client interacts with the XRPL JSON-RPC API.
 type Client struct {
-	endpoint   string
+	rpcURL     string
 	httpClient *http.Client
 }
 
-// NewClient creates an XRPL JSON-RPC client with a strict timeout.
-func NewClient(endpoint string) *Client {
+func NewClient(rpcURL string, timeout time.Duration) *Client {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	return &Client{
-		endpoint: endpoint,
+		rpcURL: rpcURL,
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: timeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 20,
+				IdleConnTimeout:     90 * time.Second,
+			},
 		},
 	}
 }
 
-// GetAccountPayments fetches validated incoming XRP payments for an address.
-func (c *Client) GetAccountPayments(ctx context.Context, account string, minLedger int64) ([]PaymentEvent, error) {
+type AccountPayment struct {
+	TxHash         string
+	LedgerIndex    int64
+	DeliveredDrops domain.Drops
+	DestinationTag uint32
+	Account        string
+	Destination    string
+	Timestamp      time.Time
+}
+
+func (c *Client) GetAccountPayments(ctx context.Context, account string, minLedger int64, maxLedger int64) ([]AccountPayment, int64, error) {
 	params := AccountTxParams{
 		Account: account,
 		Forward: true,
 	}
 
-	// Only specify range if we have a valid positive ledger checkpoint cursor.
-	// Otherwise, omitting both tells the node to check all available ledgers.
 	if minLedger > 0 {
 		params.LedgerIndexMin = minLedger
-		params.LedgerIndexMax = "-1"
+		params.LedgerIndexMax = -1
 	}
 
 	reqBody := RPCRequest{
@@ -71,94 +68,90 @@ func (c *Client) GetAccountPayments(ctx context.Context, account string, minLedg
 		Params: []interface{}{params},
 	}
 
-	jsonPayload, err := json.Marshal(reqBody)
+	data, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal rpc request: %w", err)
+		return nil, 0, fmt.Errorf("failed marshalling rpc request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(jsonPayload))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.rpcURL, bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create http request: %w", err)
+		return nil, 0, fmt.Errorf("failed creating http request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrRPCRequestFailed, err)
+		return nil, 0, fmt.Errorf("%w: %s", ErrRPCRequestFailed, err.Error())
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%w: http status %d", ErrRPCRequestFailed, resp.StatusCode)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed reading response body: %w", err)
 	}
 
 	var rpcResp AccountTxResponse
-	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
-		return nil, fmt.Errorf("failed to decode xrpl response: %w", err)
+	if err := json.Unmarshal(bodyBytes, &rpcResp); err != nil {
+		return nil, 0, fmt.Errorf("%w: %s", ErrMalformedResponse, err.Error())
 	}
 
-	if rpcResp.Result.Error != "" {
+	if rpcResp.Result.Status != "success" && rpcResp.Result.Error != "" {
 		if rpcResp.Result.Error == "actNotFound" {
-			return nil, ErrAccountNotFound
+			return nil, 0, ErrAccountNotFound
 		}
-		return nil, fmt.Errorf("%w: %s (%s)", ErrRPCRequestFailed, rpcResp.Result.Error, rpcResp.Result.ErrorMessage)
+		return nil, 0, fmt.Errorf("%w: [%s] %s", ErrRPCRequestFailed, rpcResp.Result.Error, rpcResp.Result.ErrorMessage)
 	}
 
-	var payments []PaymentEvent
-	for _, entry := range rpcResp.Result.Transactions {
-		// Rule 1: Must be validated by consensus
-		if !entry.Validated {
+	payments := make([]AccountPayment, 0, len(rpcResp.Result.Transactions))
+	var latestLedger int64 = minLedger
+
+	for _, txItem := range rpcResp.Result.Transactions {
+		if txItem.Tx.TransactionType != "Payment" {
+			continue
+		}
+		if !txItem.Validated {
+			continue
+		}
+		if txItem.Meta.TransactionResult != "tesSUCCESS" {
+			continue
+		}
+		if txItem.Tx.Destination != account {
 			continue
 		}
 
-		// Rule 2: Must be a Payment transaction
-		if entry.Tx.TransactionType != "Payment" {
+		if int64(txItem.Tx.LedgerIndex) > latestLedger {
+			latestLedger = int64(txItem.Tx.LedgerIndex)
+		}
+
+		// Security: Check DeliveredAmount to avoid partial payment exploits
+		var dropsStr string
+		if txItem.Meta.DeliveredAmount != nil {
+			if s, ok := txItem.Meta.DeliveredAmount.(string); ok {
+				dropsStr = s
+			}
+		}
+
+		if dropsStr == "" {
 			continue
 		}
 
-		// Rule 3: Transaction must have succeeded (tesSUCCESS)
-		if entry.Meta.TransactionResult != "tesSUCCESS" {
-			continue
-		}
-
-		// Rule 4: Must be destined for our monitored merchant account
-		if entry.Tx.Destination != account {
-			continue
-		}
-
-		// Rule 5: Extract delivered drops safely
-		drops, err := parseDeliveredDrops(entry.Meta.DeliveredAmount)
+		dropsInt, err := strconv.ParseInt(dropsStr, 10, 64)
 		if err != nil {
-			// Skip non-XRP (issued token) payments for now
 			continue
 		}
 
-		payments = append(payments, PaymentEvent{
-			TxHash:         entry.Tx.Hash,
-			Sender:         entry.Tx.Account,
-			Destination:    entry.Tx.Destination,
-			DestinationTag: entry.Tx.DestinationTag,
-			DeliveredDrops: drops,
-			LedgerIndex:    entry.Tx.LedgerIndex,
-			Validated:      entry.Validated,
+		paymentTime := time.Unix(txItem.Tx.Date+946684800, 0).UTC()
+
+		payments = append(payments, AccountPayment{
+			TxHash:         txItem.Tx.Hash,
+			LedgerIndex:    int64(txItem.Tx.LedgerIndex),
+			DeliveredDrops: domain.Drops(dropsInt),
+			DestinationTag: txItem.Tx.DestinationTag,
+			Account:        txItem.Tx.Account,
+			Destination:    txItem.Tx.Destination,
+			Timestamp:      paymentTime,
 		})
 	}
 
-	return payments, nil
-}
-
-// parseDeliveredDrops extracts the integer drops from the polymorphic delivered_amount field.
-// In XRPL, XRP amounts are represented as strings (e.g. "10000000").
-// Issued tokens are represented as JSON objects (e.g. {"currency": "USD", ...}).
-func parseDeliveredDrops(raw interface{}) (domain.Drops, error) {
-	switch v := raw.(type) {
-	case string:
-		dropsInt, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("invalid drops string in tx meta: %w", err)
-		}
-		return domain.FromDrops(dropsInt)
-	default:
-		return 0, fmt.Errorf("non-XRP currency format")
-	}
+	return payments, latestLedger, nil
 }

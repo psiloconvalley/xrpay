@@ -1,13 +1,11 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"html/template"
-	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,190 +13,185 @@ import (
 	"github.com/psiloconvalley/xrpay/internal/store"
 )
 
-// InvoiceManager defines the storage and tag allocation capabilities required by the API.
-type InvoiceManager interface {
-	Save(ctx context.Context, inv *domain.Invoice) error
-	GetByID(ctx context.Context, id string) (*domain.Invoice, error)
-	AllocateTag(ctx context.Context, merchantAddr string) (uint32, error)
+type CreateInvoiceRequest struct {
+	OrderID     string            `json:"order_id"`
+	Amount      string            `json:"amount"`       // Either XRP (e.g. "5.0") or Drops
+	AmountDrops int64             `json:"amount_drops"` // Explicit drops
+	ExpirySecs  int64             `json:"expiry_seconds"`
+	RedirectURL string            `json:"redirect_url"`
+	WebhookURL  string            `json:"webhook_url"`
+	Metadata    map[string]string `json:"metadata"`
 }
 
-// Config holds runtime parameters for the HTTP API.
-type Config struct {
-	MerchantAccount string
-	BaseURL         string
-	APIKey		string
-	DefaultDuration time.Duration
-	Logger          *slog.Logger
+type InvoiceStatusResponse struct {
+	ID          string               `json:"id"`
+	OrderID     string               `json:"order_id"`
+	Status      domain.InvoiceStatus `json:"status"`
+	AmountDrops domain.Drops         `json:"amount_drops"`
+	AmountXRP   string               `json:"amount_xrp"`
+	PaidDrops   domain.Drops         `json:"paid_drops"`
+	PaidXRP     string               `json:"paid_xrp"`
+	TxHash      string               `json:"tx_hash,omitempty"`
+	Settled     bool                 `json:"settled"`
+	Expired     bool                 `json:"expired"`
 }
 
-// Handler serves REST API endpoints and the checkout frontend.
 type Handler struct {
-	store           InvoiceManager
-	merchantAccount string
-	baseURL         string
-	apiKey		string
-	defaultDuration time.Duration
-	logger          *slog.Logger
+	store           store.InvoiceStore
+	merchantAddress string
+	defaultExpiry   time.Duration
 	checkoutTmpl    *template.Template
 }
 
-// CreateInvoiceRequest is the JSON payload for creating a new invoice.
-type CreateInvoiceRequest struct {
-	OrderID         string            `json:"order_id"`
-	Amount          string            `json:"amount"` // in XRP (e.g., "10.5")
-	DurationMinutes int               `json:"duration_minutes,omitempty"`
-	WebhookURL      string            `json:"webhook_url,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
-}
-
-// InvoiceResponse is the standardized JSON response for an invoice.
-type InvoiceResponse struct {
-	ID              string            `json:"id"`
-	OrderID         string            `json:"order_id"`
-	MerchantAddress string            `json:"merchant_address"`
-	DestinationTag  uint32            `json:"destination_tag"`
-	AmountExpected  string            `json:"amount_expected"`
-	AmountPaid      string            `json:"amount_paid"`
-	Status          string            `json:"status"`
-	PaymentURI      string            `json:"payment_uri"`
-	CheckoutURL     string            `json:"checkout_url"`
-	TxHash          string            `json:"tx_hash,omitempty"`
-	CreatedAt       string            `json:"created_at"`
-	ExpiresAt       string            `json:"expires_at"`
-	SettledAt       *string           `json:"settled_at,omitempty"`
-	Metadata        map[string]string `json:"metadata,omitempty"`
-}
-
-// NewHandler constructs and validates an API handler.
-func NewHandler(sm InvoiceManager, cfg Config) (*Handler, error) {
-	if sm == nil {
-		return nil, errors.New("store cannot be nil")
-	}
-	if len(cfg.MerchantAccount) < 25 || cfg.MerchantAccount[0] != 'r' {
-		return nil, fmt.Errorf("invalid merchant address: %q", cfg.MerchantAccount)
-	}
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = "http://localhost:8080"
-	}
-	cfg.BaseURL = strings.TrimRight(cfg.BaseURL, "/")
-	if cfg.DefaultDuration <= 0 {
-		cfg.DefaultDuration = 15 * time.Minute
-	}
-	if cfg.Logger == nil {
-		cfg.Logger = slog.Default()
+func NewHandler(s store.InvoiceStore, merchantAddress string, defaultExpiry time.Duration) *Handler {
+	if defaultExpiry <= 0 {
+		defaultExpiry = 15 * time.Minute
 	}
 
-	tmpl, err := template.New("checkout").Parse(checkoutHTML)
-	if err != nil {
-		return nil, fmt.Errorf("parse checkout template: %w", err)
-	}
+	tmpl := template.Must(template.New("checkout").Parse(checkoutHTMLTemplate))
 
 	return &Handler{
-		store:           sm,
-		merchantAccount: cfg.MerchantAccount,
-		baseURL:         cfg.BaseURL,
-		apiKey:		 cfg.APIKey,
-		defaultDuration: cfg.DefaultDuration,
-		logger:          cfg.Logger.With("component", "api.handler"),
+		store:           s,
+		merchantAddress: merchantAddress,
+		defaultExpiry:   defaultExpiry,
 		checkoutTmpl:    tmpl,
-	}, nil
+	}
 }
 
-// RegisterRoutes mounts API endpoints onto a http.ServeMux using Go 1.22 routing.
-func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /healthz", h.handleHealthCheck)
-	mux.HandleFunc("POST /api/v1/invoices", RequireAuth(h.apiKey, h.handleCreateInvoice))
-	mux.HandleFunc("GET /api/v1/invoices/{id}", h.handleGetInvoice)
-	mux.HandleFunc("GET /checkout/{id}", h.handleCheckoutPage)
-}
+// CreateInvoiceHandler handles POST /api/v1/invoices
+func (h *Handler) CreateInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-func (h *Handler) handleHealthCheck(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":    "healthy",
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-	})
-}
+	// Restrict request body size to 1MB
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
-func (h *Handler) handleCreateInvoice(w http.ResponseWriter, r *http.Request) {
 	var req CreateInvoiceRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json payload: " + err.Error()})
 		return
 	}
 
-	if req.OrderID == "" {
-		h.writeError(w, http.StatusBadRequest, "order_id is required")
+	var drops domain.Drops
+	if req.AmountDrops > 0 {
+		drops = domain.Drops(req.AmountDrops)
+	} else if req.Amount != "" {
+		parsed, err := domain.ParseXRP(req.Amount)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid amount: " + err.Error()})
+			return
+		}
+		drops = parsed
+	} else {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "either amount or amount_drops is required"})
 		return
 	}
 
-	amount, err := domain.ParseXRP(req.Amount)
+	expiry := h.defaultExpiry
+	if req.ExpirySecs > 0 {
+		expiry = time.Duration(req.ExpirySecs) * time.Second
+	}
+
+	destTag, err := h.store.AllocateTag(r.Context(), h.merchantAddress)
 	if err != nil {
-		h.writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid amount %q: %v", req.Amount, err))
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed allocating tag"})
 		return
 	}
 
-	duration := h.defaultDuration
-	if req.DurationMinutes > 0 {
-		duration = time.Duration(req.DurationMinutes) * time.Minute
-	}
-
-	tag, err := h.store.AllocateTag(r.Context(), h.merchantAccount)
+	inv, err := domain.NewInvoice(
+		req.OrderID,
+		h.merchantAddress,
+		destTag,
+		drops,
+		expiry,
+		time.Now().UTC(),
+		req.RedirectURL,
+		req.WebhookURL,
+		req.Metadata,
+	)
 	if err != nil {
-		h.logger.ErrorContext(r.Context(), "failed to allocate destination tag", "error", err)
-		h.writeError(w, http.StatusInternalServerError, "failed to allocate payment destination tag")
-		return
-	}
-
-	inv, err := domain.NewInvoice(req.OrderID, h.merchantAccount, tag, amount, duration, req.WebhookURL, req.Metadata)
-	if err != nil {
-		h.writeError(w, http.StatusBadRequest, "failed to create invoice: "+err.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
 	if err := h.store.Save(r.Context(), inv); err != nil {
-		h.logger.ErrorContext(r.Context(), "failed to save invoice", "invoice_id", inv.ID, "error", err)
-		h.writeError(w, http.StatusInternalServerError, "failed to persist invoice")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed saving invoice"})
 		return
 	}
 
-	h.logger.InfoContext(r.Context(), "invoice created",
-		"invoice_id", inv.ID,
-		"order_id", inv.OrderID,
-		"tag", inv.DestinationTag,
-		"amount", inv.AmountExpected.String(),
-	)
-
-	resp := h.toInvoiceResponse(inv)
-	writeJSON(w, http.StatusCreated, resp)
+	writeJSON(w, http.StatusCreated, inv)
 }
 
-func (h *Handler) handleGetInvoice(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		h.writeError(w, http.StatusBadRequest, "invoice id is required")
+// GetInvoiceHandler handles GET /api/v1/invoices/{id} (Protected Private Details)
+func (h *Handler) GetInvoiceHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/invoices/")
 
 	inv, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			h.writeError(w, http.StatusNotFound, "invoice not found")
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "invoice not found"})
 			return
 		}
-		h.logger.ErrorContext(r.Context(), "failed to fetch invoice", "invoice_id", id, "error", err)
-		h.writeError(w, http.StatusInternalServerError, "internal storage error")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, h.toInvoiceResponse(inv))
+	writeJSON(w, http.StatusOK, inv)
 }
 
-func (h *Handler) handleCheckoutPage(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if id == "" {
-		http.Error(w, "Invoice ID required", http.StatusBadRequest)
+// GetInvoicePublicStatusHandler handles GET /api/v1/invoices/{id}/status (Public Safe Endpoint)
+func (h *Handler) GetInvoicePublicStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/api/v1/invoices/")
+	id = strings.TrimSuffix(id, "/status")
+
+	inv, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "invoice not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store error"})
+		return
+	}
+
+	resp := InvoiceStatusResponse{
+		ID:          inv.ID,
+		OrderID:     inv.OrderID,
+		Status:      inv.Status,
+		AmountDrops: inv.AmountDrops,
+		AmountXRP:   inv.AmountXRP,
+		PaidDrops:   inv.PaidDrops,
+		PaidXRP:     inv.PaidXRP,
+		TxHash:      inv.TxHash,
+		Settled:     inv.Status == domain.StatusSettled || inv.Status == domain.StatusOverpaid,
+		Expired:     inv.Status == domain.StatusExpired,
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// CheckoutHandler serves the HTML UI for the customer checkout process
+func (h *Handler) CheckoutHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := strings.TrimPrefix(r.URL.Path, "/checkout/")
 
 	inv, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
@@ -206,205 +199,183 @@ func (h *Handler) handleCheckoutPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := h.toInvoiceResponse(inv)
+	data := struct {
+		Invoice     *domain.Invoice
+		FormattedTag string
+	}{
+		Invoice:      inv,
+		FormattedTag: strconv.FormatUint(uint64(inv.DestinationTag), 10),
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := h.checkoutTmpl.Execute(w, resp); err != nil {
-		h.logger.ErrorContext(r.Context(), "failed to render checkout template", "error", err)
-	}
+	_ = h.checkoutTmpl.Execute(w, data)
 }
 
-func (h *Handler) toInvoiceResponse(inv *domain.Invoice) InvoiceResponse {
-	amountXRP := inv.AmountExpected.ToXRPString()
-	paymentURI := fmt.Sprintf("xrpl:%s?amount=%s&dt=%d", inv.MerchantAddr, amountXRP, inv.DestinationTag)
-	checkoutURL := fmt.Sprintf("%s/checkout/%s", h.baseURL, inv.ID)
-
-	var settledAtStr *string
-	if inv.SettledAt != nil {
-		s := inv.SettledAt.UTC().Format(time.RFC3339)
-		settledAtStr = &s
-	}
-
-	return InvoiceResponse{
-		ID:              inv.ID,
-		OrderID:         inv.OrderID,
-		MerchantAddress: inv.MerchantAddr,
-		DestinationTag:  inv.DestinationTag,
-		AmountExpected:  inv.AmountExpected.String(),
-		AmountPaid:      inv.AmountPaid.String(),
-		Status:          string(inv.Status),
-		PaymentURI:      paymentURI,
-		CheckoutURL:     checkoutURL,
-		TxHash:          inv.TxHash,
-		CreatedAt:       inv.CreatedAt.UTC().Format(time.RFC3339),
-		ExpiresAt:       inv.ExpiresAt.UTC().Format(time.RFC3339),
-		SettledAt:       settledAtStr,
-		Metadata:        inv.Metadata,
-	}
-}
-
-func (h *Handler) writeError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
-}
-
-func writeJSON(w http.ResponseWriter, code int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
 }
 
-// Embedded zero-dependency HTML template for the checkout page.
-const checkoutHTML = `<!DOCTYPE html>
+const checkoutHTMLTemplate = `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Pay with XRP | xrpay</title>
+    <title>Pay with XRP</title>
     <style>
         :root {
             --bg-color: #0f172a;
             --card-bg: #1e293b;
+            --text-color: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --success: #10b981;
+            --danger: #ef4444;
             --border-color: #334155;
-            --text-primary: #f8fafc;
-            --text-secondary: #94a3b8;
-            --accent: #22d3ee;
-            --success: #34d399;
-            --warning: #fbbf24;
-            --error: #f87171;
         }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
+            background-color: var(--bg-color);
+            color: var(--text-color);
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: var(--bg-color);
-            color: var(--text-primary);
+            margin: 0;
             display: flex;
-            justify-content: center;
             align-items: center;
+            justify-content: center;
             min-height: 100vh;
-            padding: 1rem;
         }
-        .card {
-            background: var(--card-bg);
+        .container {
+            background-color: var(--card-bg);
             border: 1px solid var(--border-color);
             border-radius: 12px;
+            padding: 32px;
             width: 100%;
-            max-width: 440px;
-            padding: 2rem;
-            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+            max-width: 420px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+            box-sizing: border-box;
+            text-align: center;
         }
-        .header { text-align: center; margin-bottom: 1.5rem; }
-        .header h1 { font-size: 1.25rem; font-weight: 600; color: var(--text-secondary); }
-        .amount { font-size: 2.25rem; font-weight: 700; color: var(--accent); margin-top: 0.25rem; }
-        .field { margin-bottom: 1.25rem; }
-        .field label { display: block; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-secondary); margin-bottom: 0.25rem; }
-        .field-val {
-            background: #090d16;
-            border: 1px solid var(--border-color);
-            padding: 0.75rem;
-            border-radius: 6px;
-            font-family: "SF Mono", Monaco, Menlo, monospace;
-            font-size: 0.875rem;
-            word-break: break-all;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+        h2 { margin: 0 0 8px 0; font-size: 24px; font-weight: 700; }
+        .subtitle { color: var(--text-muted); font-size: 14px; margin-bottom: 24px; }
+        .amount-box {
+            background-color: rgba(59, 130, 246, 0.1);
+            border: 1px dashed var(--primary);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 24px;
         }
-        .tag-badge { background: #083344; color: var(--accent); font-weight: 700; padding: 0.25rem 0.5rem; border-radius: 4px; }
-        .badge-status {
+        .amount-val { font-size: 32px; font-weight: 800; color: var(--primary); }
+        .amount-lbl { font-size: 12px; color: var(--text-muted); text-transform: uppercase; margin-top: 4px; }
+        .instruction { text-align: left; background: #0f172a; border-radius: 8px; padding: 16px; margin-bottom: 24px; border: 1px solid var(--border-color); }
+        .inst-row { display: flex; justify-content: space-between; margin-bottom: 12px; font-size: 14px; }
+        .inst-row:last-child { margin-bottom: 0; }
+        .lbl { color: var(--text-muted); }
+        .val { font-family: monospace; font-weight: 600; cursor: pointer; color: #fff; background: #1e293b; padding: 2px 6px; border-radius: 4px; word-break: break-all; }
+        .val:hover { background: #334155; }
+        .status-badge {
             display: inline-block;
-            padding: 0.25rem 0.75rem;
+            padding: 8px 16px;
             border-radius: 9999px;
-            font-size: 0.75rem;
+            font-size: 14px;
             font-weight: 600;
+            margin-bottom: 8px;
             text-transform: uppercase;
         }
-        .status-pending { background: rgba(251, 191, 36, 0.2); color: var(--warning); border: 1px solid var(--warning); }
-        .status-settled { background: rgba(52, 211, 153, 0.2); color: var(--success); border: 1px solid var(--success); }
-        .status-expired { background: rgba(248, 113, 113, 0.2); color: var(--error); border: 1px solid var(--error); }
-        .warning-box {
-            background: rgba(251, 191, 36, 0.1);
-            border: 1px solid var(--warning);
-            border-radius: 6px;
-            padding: 0.75rem;
-            font-size: 0.8rem;
-            color: var(--warning);
-            margin-bottom: 1.25rem;
-            line-height: 1.4;
-        }
-        .btn-wallet {
-            display: block;
-            width: 100%;
-            text-align: center;
-            background: var(--accent);
-            color: #0f172a;
-            font-weight: 700;
-            padding: 0.75rem;
-            border-radius: 6px;
-            text-decoration: none;
-            margin-top: 1rem;
-            transition: opacity 0.2s;
-        }
-        .btn-wallet:hover { opacity: 0.9; }
-        .footer { text-align: center; margin-top: 1.5rem; font-size: 0.75rem; color: var(--text-secondary); }
+        .status-PENDING { background-color: rgba(59, 130, 246, 0.2); color: var(--primary); }
+        .status-PARTIALLY_PAID { background-color: rgba(245, 158, 11, 0.2); color: #f59e0b; }
+        .status-SETTLED { background-color: rgba(16, 185, 129, 0.2); color: var(--success); }
+        .status-OVERPAID { background-color: rgba(16, 185, 129, 0.2); color: var(--success); }
+        .status-EXPIRED { background-color: rgba(239, 68, 68, 0.2); color: var(--danger); }
+        .timer { font-size: 13px; color: var(--text-muted); margin-top: 8px; }
+        .footer { font-size: 11px; color: var(--text-muted); margin-top: 32px; display: flex; align-items: center; justify-content: center; gap: 4px; }
+        .footer a { color: var(--primary); text-decoration: none; }
     </style>
 </head>
 <body>
-    <div class="card">
-        <div class="header">
-            <h1>Payment Required</h1>
-            <div class="amount">{{.AmountExpected}}</div>
-            <div style="margin-top: 0.5rem;">
-                <span id="status-badge" class="badge-status status-{{.Status}}">{{.Status}}</span>
+    <div class="container">
+        <h2>Pay with XRP</h2>
+        <div class="subtitle">Order #{{ .Invoice.OrderID }}</div>
+
+        <div class="amount-box">
+            <div class="amount-val">{{ .Invoice.AmountXRP }} XRP</div>
+            <div class="amount-lbl">Total Amount Due</div>
+        </div>
+
+        <div class="instruction">
+            <div class="inst-row">
+                <span class="lbl">Recipient Address:</span>
+                <span class="val" onclick="copyText('{{ .Invoice.MerchantAddress }}')">{{ .Invoice.MerchantAddress }}</span>
+            </div>
+            <div class="inst-row">
+                <span class="lbl">Destination Tag:</span>
+                <span class="val" onclick="copyText('{{ .FormattedTag }}')" style="font-size: 16px; color: #f59e0b;">{{ .FormattedTag }}</span>
             </div>
         </div>
 
-        <div class="warning-box">
-            <strong>CRITICAL:</strong> You MUST include the <strong>Destination Tag</strong> when sending. Payments without tags cannot be credited.
+        <div style="margin-top: 16px;">
+            <div id="statusBadge" class="status-badge status-{{ .Invoice.Status }}">{{ .Invoice.Status }}</div>
+            <div id="countdown" class="timer">Checking payment status...</div>
         </div>
-
-        <div class="field">
-            <label>Recipient XRP Address</label>
-            <div class="field-val">{{.MerchantAddress}}</div>
-        </div>
-
-        <div class="field">
-            <label>Destination Tag (Required)</label>
-            <div class="field-val"><span class="tag-badge">{{.DestinationTag}}</span></div>
-        </div>
-
-        <div class="field">
-            <label>Order ID</label>
-            <div class="field-val">{{.OrderID}}</div>
-        </div>
-
-        <a href="{{.PaymentURI}}" class="btn-wallet">Open in XRP Wallet</a>
 
         <div class="footer">
-            Powered by <strong>xrpay</strong> &bull; Zero-fee XRP Gateway
+            Powered by <a href="https://github.com/psiloconvalley/xrpay" target="_blank">xrpay</a> payment gateway
         </div>
     </div>
 
     <script>
-        // Auto-refresh status every 2.5 seconds until terminal
-        const invoiceId = "{{.ID}}";
-        const interval = setInterval(async () => {
-            try {
-                const res = await fetch("/api/v1/invoices/" + invoiceId);
-                if (res.ok) {
-                    const data = await res.json();
-                    const badge = document.getElementById("status-badge");
-                    badge.innerText = data.status;
-                    badge.className = "badge-status status-" + data.status;
-                    if (data.status === "settled" || data.status === "overpaid" || data.status === "expired") {
-                        clearInterval(interval);
-                        if (data.status === "settled" || data.status === "overpaid") {
-                            setTimeout(() => alert("Payment Received! Thank you."), 500);
-                        }
-                    }
-                }
-            } catch (err) {
-                console.error("Status check failed", err);
+        function copyText(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                alert("Copied to clipboard: " + text);
+            });
+        }
+
+        const invoiceId = "{{ .Invoice.ID }}";
+        const expiresAt = new Date("{{ .Invoice.ExpiresAt.Format "2006-01-02T15:04:05Z07:00" }}").getTime();
+
+        function updateTimer() {
+            const now = new Date().getTime();
+            const distance = expiresAt - now;
+
+            if (distance < 0) {
+                document.getElementById("countdown").innerHTML = "Invoice expired";
+                return;
             }
-        }, 2500);
+
+            const minutes = Math.floor((distance % (1000 * 64 * 60)) / (1000 * 60));
+            const seconds = Math.floor((distance % (1000 * 60)) / 1000);
+            document.getElementById("countdown").innerHTML = "Payment window closes in " + minutes + "m " + seconds + "s";
+        }
+
+        setInterval(updateTimer, 1000);
+        updateTimer();
+
+        function pollStatus() {
+            fetch("/api/v1/invoices/" + invoiceId + "/status")
+                .then(r => r.json())
+                .then(data => {
+                    const badge = document.getElementById("statusBadge");
+                    badge.innerHTML = data.status;
+                    badge.className = "status-badge status-" + data.status;
+
+                    if (data.settled) {
+                        badge.innerHTML = "Payment Received! Thank you.";
+                        document.getElementById("countdown").innerHTML = "Redirecting...";
+                        setTimeout(() => {
+                            if (data.redirect_url) {
+                                window.location.href = data.redirect_url;
+                            }
+                        }, 2000);
+                        return;
+                    }
+
+                    if (data.status !== "EXPIRED") {
+                        setTimeout(pollStatus, 2000);
+                    }
+                })
+                .catch(() => setTimeout(pollStatus, 4000));
+        }
+        pollStatus();
     </script>
 </body>
 </html>`
