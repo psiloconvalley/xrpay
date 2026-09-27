@@ -15,6 +15,7 @@ import (
 
 	"github.com/psiloconvalley/xrpay/internal/api"
 	"github.com/psiloconvalley/xrpay/internal/domain"
+	"github.com/psiloconvalley/xrpay/internal/security"
 	"github.com/psiloconvalley/xrpay/internal/store"
 	"github.com/psiloconvalley/xrpay/internal/webhook"
 	"github.com/psiloconvalley/xrpay/internal/xrpl"
@@ -156,24 +157,24 @@ func main() {
 	// Checkout UI (Public)
 	mux.HandleFunc("/checkout/", apiHandler.CheckoutHandler)
 
-	// Invoice Status (Public Safe Endpoint)
+	// Invoice Status & Protected Routes
 	mux.HandleFunc("/api/v1/invoices/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/status") && r.Method == http.MethodGet {
 			apiHandler.GetInvoicePublicStatusHandler(w, r)
 			return
 		}
 		if r.Method == http.MethodPost {
-			api.RequireAuth(cfg.APIKey, apiHandler.CreateInvoiceHandler).ServeHTTP(w, r)
+			security.RequireAuth(cfg.APIKey, apiHandler.CreateInvoiceHandler).ServeHTTP(w, r)
 			return
 		}
 		if r.Method == http.MethodGet {
-			api.RequireAuth(cfg.APIKey, apiHandler.GetInvoiceHandler).ServeHTTP(w, r)
+			security.RequireAuth(cfg.APIKey, apiHandler.GetInvoiceHandler).ServeHTTP(w, r)
 			return
 		}
-				http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	})
 
-	// Global HTTP middleware
+	// Global HTTP logging & panic recovery middleware
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		defer func() {
@@ -193,7 +194,7 @@ func main() {
 		)
 	})
 
-	securedHandler := api.SecurityHeadersMiddleware(api.CORSMiddleware(handler))
+	securedHandler := security.SecurityHeadersMiddleware(security.CORSMiddleware(handler))
 
 	server := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -236,4 +237,3 @@ func main() {
 		logger.Info("server exited cleanly")
 	}
 }
-
