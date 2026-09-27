@@ -199,7 +199,7 @@ const landingHTMLTemplate = `<!DOCTYPE html>
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 2rem;
+            margin-bottom: 1.5rem;
             border-bottom: 1px solid var(--border-muted);
             padding-bottom: 1rem;
         }
@@ -339,6 +339,9 @@ const landingHTMLTemplate = `<!DOCTYPE html>
                 <div class="card-title">⏣ INSTANT POINT-OF-SALE &amp; DONATION CHECKOUT</div>
                 <span class="heartbeat" style="color:var(--accent-cyan); background:rgba(56,189,248,0.08); border-color:rgba(56,189,248,0.2);">0% PLATFORM FEE</span>
             </div>
+            <p style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 1.5rem; line-height: 1.5;">
+                Support this open-source project! Specify any custom XRP tip amount below to generate a point-of-sale checkout invoice settling directly to our developer wallet.
+            </p>
             <form action="/demo/invoice" method="POST">
                 <div class="form-grid">
                     <div class="form-group">
@@ -357,7 +360,7 @@ const landingHTMLTemplate = `<!DOCTYPE html>
                     <label for="memo">Order Description / Tip Message (Optional)</label>
                     <input type="text" id="memo" name="memo" value="Support Sovereign Open-Source xrpay" placeholder="e.g. Donation from @twitterhandle, Coffee tip, or API invoice">
                 </div>
-                <button type="submit" class="btn" style="width: 100%; background: var(--accent-cyan); color: var(--bg-primary); font-weight: 800;">Generate Point-of-Sale Checkout &rarr;</button>
+                <button type="submit" class="btn" style="width: 100%; background: var(--accent-cyan); color: var(--bg-primary); font-weight: 800; justify-content: center;">Generate Invoice / Donate Now ⚡</button>
             </form>
         </section>
 
